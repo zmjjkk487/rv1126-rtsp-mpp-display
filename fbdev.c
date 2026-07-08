@@ -1,0 +1,220 @@
+#include "fbdev.h"
+#include "log.h"
+#include "rga_convert.h"
+#include <fcntl.h>
+#include <linux/fb.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+int fb_init(fb_t *f, const char *device) {
+    memset(f, 0, sizeof(*f));
+    f->fd = open(device, O_RDWR);
+    if (f->fd < 0) {
+        LOGE("打开 %s: %s", device, strerror(errno));
+        return -1;
+    }
+
+    struct fb_var_screeninfo vi;
+    struct fb_fix_screeninfo fi;
+    if (ioctl(f->fd, FBIOGET_VSCREENINFO, &vi) < 0) {
+        LOGE("FBIOGET_VSCREENINFO");
+        goto fail;
+    }
+    if (ioctl(f->fd, FBIOGET_FSCREENINFO, &fi) < 0) {
+        LOGE("FBIOGET_FSCREENINFO");
+        goto fail;
+    }
+
+    f->w = vi.xres;
+    f->h = vi.yres;
+    f->bpp = vi.bits_per_pixel;
+    f->line_len = fi.line_length;
+    f->scr_size = fi.smem_len;
+    LOGI("FB: %ux%u %ubpp line=%u", f->w, f->h, f->bpp, f->line_len);
+
+    f->mem = mmap(0, f->scr_size, PROT_READ | PROT_WRITE, MAP_SHARED, f->fd, 0);
+    if (f->mem == MAP_FAILED) {
+        LOGE("mmap fb");
+        goto fail;
+    }
+
+    f->size = f->w * f->h * 4;
+    f->back = malloc(f->size);
+    if (!f->back) {
+        LOGE("malloc backbuf");
+        goto fail_mmap;
+    }
+    memset(f->back, 0, f->size);
+
+    /* 初始化 RGA 上下文（可选，失败不致命） */
+    f->rga_ok = (rga_init(&f->rga, 1920, 1080, (int)f->w, (int)f->h) == 0);
+    if (f->rga_ok)
+        LOGI("RGA 硬件转换已启用 (NV12→RGB)");
+    else
+        LOGI("RGA 不可用, 使用 CPU 软件转换");
+
+    return 0;
+
+fail_mmap:
+    munmap(f->mem, f->scr_size);
+    f->mem = NULL;
+fail:
+    close(f->fd);
+    f->fd = -1;
+    return -1;
+}
+
+void fb_deinit(fb_t *f) {
+    if (f->rga_ok)
+        rga_deinit(&f->rga);
+    if (f->back) {
+        free(f->back);
+        f->back = NULL;
+    }
+    if (f->mem) {
+        munmap(f->mem, f->scr_size);
+        f->mem = NULL;
+    }
+    if (f->fd >= 0) {
+        close(f->fd);
+        f->fd = -1;
+    }
+}
+
+/* NV12 → RGB888 (BT.601) */
+static void nv12_to_rgb888(const uint8_t *y, const uint8_t *uv, int w, int h,
+                           int y_stride, uint32_t *dst, int dst_stride) {
+    for (int r = 0; r < h; r++) {
+        for (int c = 0; c < w; c++) {
+            int Y = y[r * y_stride + c];
+            int U = uv[(r / 2) * y_stride + (c & ~1)];
+            int V = uv[(r / 2) * y_stride + (c & ~1) + 1];
+            int C = Y - 16, D = U - 128, E = V - 128;
+            int R = (298 * C + 409 * E + 128) >> 8;
+            int G = (298 * C - 100 * D - 208 * E + 128) >> 8;
+            int B = (298 * C + 516 * D + 128) >> 8;
+            if (R < 0)
+                R = 0;
+            else if (R > 255)
+                R = 255;
+            if (G < 0)
+                G = 0;
+            else if (G > 255)
+                G = 255;
+            if (B < 0)
+                B = 0;
+            else if (B > 255)
+                B = 255;
+            dst[r * dst_stride + c] = (R << 16) | (G << 8) | B;
+        }
+    }
+}
+
+/* 最近邻缩放 — NV12 */
+static void scale_nv12_nearest(const uint8_t *y, const uint8_t *uv, int sw,
+                               int sh, int y_stride, uint8_t *dy, uint8_t *duv,
+                               int dw, int dh) {
+    int xr = ((sw << 16) / dw) + 1;
+    int yr = ((sh << 16) / dh) + 1;
+
+    for (int r = 0; r < dh; r++) {
+        int sr = (r * yr) >> 16;
+        if (sr >= sh)
+            sr = sh - 1;
+        for (int c = 0; c < dw; c++) {
+            int sc = (c * xr) >> 16;
+            if (sc >= sw)
+                sc = sw - 1;
+            dy[r * dw + c] = y[sr * y_stride + sc];
+        }
+    }
+    for (int r = 0; r < dh / 2; r++) {
+        int sr = (r * yr) >> 16;
+        if (sr >= sh / 2)
+            sr = sh / 2 - 1;
+        for (int c = 0; c < dw / 2; c++) {
+            int sc = (c * xr) >> 16;
+            if (sc >= sw / 2)
+                sc = sw / 2 - 1;
+            int sp = sr * y_stride + sc * 2, dp = r * dw + c * 2;
+            duv[dp] = uv[sp];
+            duv[dp + 1] = uv[sp + 1];
+        }
+    }
+}
+
+void fb_show_nv12(fb_t *f, const uint8_t *y, const uint8_t *uv, int sw, int sh,
+                  int y_stride) {
+    if (!f->mem || !f->back)
+        return;
+    int dw = (int)f->w, dh = (int)f->h;
+
+    /*
+     * 策略: RGA 硬件优先 (零 CPU), 失败回退 CPU 软件转换。
+     *
+     * 教程第5章: RGA 一次完成 NV12→RGB 转换 + 缩放，无需 CPU 参与。
+     * 如果板端缺少 librga.so，自动回到 CPU 路径。
+     */
+
+    /* 尝试 RGA 硬件转换 */
+    if (f->rga_ok && y && uv) {
+        /* 更新 RGA 源尺寸(防止分辨率变化) */
+        if (sw != f->rga.src_w || sh != f->rga.src_h) {
+            rga_deinit(&f->rga);
+            f->rga_ok = (rga_init(&f->rga, sw, sh, dw, dh) == 0);
+        }
+
+        if (f->rga_ok) {
+            /* RGA 直接输出 RGB 到 back buffer */
+            uint8_t *rgb_buf = (uint8_t *)f->back;
+            if (rga_nv12_to_rgb(&f->rga, y, uv, rgb_buf) == 0)
+                goto write_fb; /* RGA 成功，跳过 CPU 转换 */
+        }
+    }
+
+    /* === CPU 软件回退路径 === */
+
+    if (sw > dw || sh > dh) {
+        /* 需要缩小: 先用最近邻缩放到屏幕尺寸 NV12，再转 RGB */
+        int ysz = dw * dh, uvsz = (dw / 2) * (dh / 2) * 2;
+        uint8_t *sy = malloc(ysz), *suv = malloc(uvsz);
+        if (!sy || !suv) {
+            free(sy);
+            free(suv);
+            return;
+        }
+        scale_nv12_nearest(y, uv, sw, sh, y_stride, sy, suv, dw, dh);
+        memset(f->back, 0, f->size);
+        nv12_to_rgb888(sy, suv, dw, dh, dw, (uint32_t *)f->back, f->w);
+        free(sy);
+        free(suv);
+    } else {
+        /* 直接转换（源 ≤ 目标尺寸） */
+        dw = sw < (int)f->w ? sw : (int)f->w;
+        dh = sh < (int)f->h ? sh : (int)f->h;
+        memset(f->back, 0, f->size);
+        nv12_to_rgb888(y, uv, dw, dh, y_stride, (uint32_t *)f->back, f->w);
+    }
+
+write_fb:
+    /* 写显存 — 处理 16bpp 和 32bpp 两种格式 */
+    if (f->bpp == 16) {
+        uint16_t *d = (uint16_t *)f->mem;
+        uint32_t *s = (uint32_t *)f->back;
+        for (int r = 0; r < dh; r++)
+            for (int c = 0; c < dw; c++) {
+                uint32_t p = s[r * f->w + c];
+                d[r * f->line_len / 2 + c] =
+                    (uint16_t)(((p >> 19) << 11) | (((p >> 10) & 0x3F) << 5) |
+                               ((p >> 3) & 0x1F));
+            }
+    } else {
+        uint32_t *d = (uint32_t *)f->mem, *s = (uint32_t *)f->back;
+        for (int r = 0; r < dh; r++)
+            memcpy(&d[r * f->line_len / 4], &s[r * f->w], dw * 4);
+    }
+}
