@@ -74,7 +74,7 @@ static int load_rga_library(void) {
 /* === 公开接口 === */
 
 int rga_init(rga_ctx_t *ctx, int sw, int sh, int src_stride, int src_vstride,
-             int dw, int dh) {
+             int dw, int dh, int dst_buf_stride) {
     memset(ctx, 0, sizeof(*ctx));
     if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0)
         return -1;
@@ -83,24 +83,21 @@ int rga_init(rga_ctx_t *ctx, int sw, int sh, int src_stride, int src_vstride,
 
     ctx->src_w = sw;
     ctx->src_h = sh;
-    /* src_stride 必须从 MPP hor_stride 获取，不能写死 width。
-     * 硬件对齐可能导致 stride > width，写死 width 会导致 UV 偏移→色偏。 */
     ctx->src_stride = (src_stride > 0) ? src_stride : sw;
-    /* src_vstride 必须从 MPP ver_stride 获取（16 对齐，可能 > height）。
-     * RGA 按 wstride*hstride 定位 NV12 的 UV 平面：1080p 时 ver_stride=1088，
-     * 若 hstride 用 height=1080，UV 会偏移 8 行导致色偏。 */
     ctx->src_vstride = (src_vstride > 0) ? src_vstride : sh;
     ctx->dst_w = dw;
     ctx->dst_h = dh;
-    ctx->dst_stride = dw * 4; /* BGRX_8888: 4 字节/像素 */
+    /* dst_buf_stride 是目标缓冲区全宽 (屏幕宽), 不是缩放宽 vw。
+     * RGA 的 wstride 用 buf_stride 才能正确跳行 */
+    ctx->dst_stride = (dst_buf_stride > 0) ? dst_buf_stride : dw;
 
-    LOGI("RGA: NV12 %dx%d (hstride=%d vstride=%d) -> BGRX_8888 %dx%d", sw, sh,
-         ctx->src_stride, ctx->src_vstride, dw, dh);
+    LOGI("RGA: NV12 %dx%d (hstride=%d vstride=%d) -> BGRX_8888 %dx%d buf_stride=%d",
+         sw, sh, ctx->src_stride, ctx->src_vstride, dw, dh, ctx->dst_stride);
     return 0;
 }
 
 int rga_nv12_to_rgb(rga_ctx_t *ctx, const uint8_t *y, const uint8_t *uv,
-                    uint8_t *rgb) {
+                    uint8_t *rgb, int xoff, int yoff) {
     if (!p_RkRgaBlit || !y || !rgb)
         return -1;
     (void)uv; /* NV12: UV 紧接 Y 后面，RGA 库从 Y 指针自己定位 UV */
@@ -129,11 +126,11 @@ int rga_nv12_to_rgb(rga_ctx_t *ctx, const uint8_t *y, const uint8_t *uv,
     dst.mmuFlag = 1;
     dst.sync_mode = 1;
     dst.format = RK_FORMAT_BGRX_8888;
-    dst.rect.xoffset = 0;
-    dst.rect.yoffset = 0;
+    dst.rect.xoffset = xoff;
+    dst.rect.yoffset = yoff;
     dst.rect.width = ctx->dst_w;
     dst.rect.height = ctx->dst_h;
-    dst.rect.wstride = ctx->dst_w;
+    dst.rect.wstride = ctx->dst_stride; /* 缓冲全宽, 不是缩放宽 */
     dst.rect.hstride = ctx->dst_h;
     dst.rect.format = RK_FORMAT_BGRX_8888;
 

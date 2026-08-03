@@ -1,9 +1,8 @@
 /*
- * ffmpeg_demux.c — FFmpeg C API RTSP 解复用器
+ * ❌ 废弃 — FFmpeg C API RTSP 解复用器 (仅 main_native.c 使用)
  *
- * 替代 ffmpeg_pipe.c (fork+pipe) 方案。
- * 使用 avformat_open_input / av_read_frame 获取完整帧，
- * 数据格式为 Annex-B H.264 裸流。
+ * 问题: 实测 RTSP 拉流帧率过低 (~1fps), 不如 GStreamer rtspsrc。
+ * 正式方案使用 GStreamer 管线拉流, 不经过本文件。
  */
 
 #include "ffmpeg_demux.h"
@@ -53,7 +52,11 @@ ffmpeg_demux_t *ffmpeg_demux_open(const config_t *c) {
         LOGW("avformat_open_input: %s, TCP 回退", eb);
         AVDictionary *retry = NULL;
         av_dict_set(&retry, "rtsp_transport", "tcp", 0);
-        av_dict_set(&retry, "stimeout", to_str, 0);
+        av_dict_set(&retry, "stimeout", "3000000", 0);
+        av_dict_set(&retry, "probesize", "32768", 0);
+        av_dict_set(&retry, "max_delay", "500000", 0);
+        av_dict_set(&retry, "analyzeduration", "1000000", 0);
+        av_dict_set(&retry, "fflags", "nobuffer", 0);
         ret = avformat_open_input(&fmt, c->rtsp_url, NULL, &retry);
         av_dict_free(&retry);
     }

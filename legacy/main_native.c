@@ -1,15 +1,14 @@
 /*
- * RV1126 RTSP 硬解码 显示 Demo
- * ============================================
- * 平台: Rockchip RV1126, Buildroot Linux
- * 架构: FFmpeg avformat 拆帧 → MPP 硬解 H.264 → (RGA|CPU) NV12→RGB →
- * (DRM|fbdev) 显示 编译: ./build.sh    运行: ./rv1126_rtsp_mpp config.ini
+ * ❌ 废弃 — 原生 MPP API 方案 (FFmpeg 拉流 + 裸 MPP 解码)
  *
- * 数据流:
- *   RTSP 摄像头 → FFmpeg(avformat) 拉流 → H.264 Annex-B 裸码流
- *   → MPP decode_put_packet / decode_get_frame → NV12 YUV 帧
- *   → RGA(硬件) / CPU(软件) NV12→RGB 颜色转换
- *   → DRM(硬件) / fbdev(软件) 显示到 MIPI 屏幕
+ * 问题:
+ *   1. FFmpeg RTSP 拉流慢 (0.9fps), 不如 GStreamer rtspsrc
+ *   2. alientek 定制 MPP 的 legacy decode_put_packet 有 4KB 包限制,
+ *      split_parse + chunk 输入 + drain 交替才能工作, 维护成本高
+ *   3. mpp_dec_* 函数名与 librockchip_mpp.so 符号冲突 (已改为 mpphw_*)
+ *
+ * 当前用途: 仅作 API 参考, 不编译不运行
+ * 正式方案: main.c (GStreamer + RGA 混合管线)
  */
 
 #include <signal.h>

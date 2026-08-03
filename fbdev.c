@@ -56,7 +56,7 @@ int fb_init(fb_t *f, const char *device) {
      * src_stride / src_vstride 初始为占位值，后续会被 MPP 真实的
      * hor_stride / ver_stride 覆盖（1080p 对齐后 vstride = 1088）。 */
     f->rga_ok =
-        (rga_init(&f->rga, 1920, 1080, 1920, 1088, (int)f->w, (int)f->h) == 0);
+        (rga_init(&f->rga, 1920, 1080, 1920, 1088, (int)f->w, (int)f->h, (int)f->w) == 0);
     if (f->rga_ok)
         LOGI("RGA 硬件转换已启用 (NV12→RGB)");
     else
@@ -156,6 +156,7 @@ void fb_show_nv12(fb_t *f, const uint8_t *y, const uint8_t *uv, int sw, int sh,
                   int y_stride, int y_vstride) {
     if (!f->mem || !f->back)
         return;
+    f->frame_nr++;
     int dw = (int)f->w, dh = (int)f->h;
 
     /* 等比缩放: 保持视频宽高比, 补黑边填满屏幕 */
@@ -188,16 +189,17 @@ void fb_show_nv12(fb_t *f, const uint8_t *y, const uint8_t *uv, int sw, int sh,
             vw != f->rga.dst_w || vh != f->rga.dst_h) {
             rga_deinit(&f->rga);
             f->rga_ok =
-                (rga_init(&f->rga, sw, sh, y_stride, y_vstride, vw, vh) == 0);
+                (rga_init(&f->rga, sw, sh, y_stride, y_vstride, vw, vh, (int)f->w) == 0);
         }
 
         if (f->rga_ok) {
-            memset(f->back, 0, f->size); /* 先清黑, RGA 只写视频区 */
-            /* RGA 输出到 back buffer 的等比缩放子区域 (偏移 xoff, yoff) */
-            uint8_t *dst = (uint8_t *)f->back + yoff * (int)f->w * 4 +
-                           xoff * 4;
-            if (rga_nv12_to_rgb(&f->rga, y, uv, dst) == 0)
-                goto write_fb; /* RGA 成功，跳过 CPU 转换 */
+            /* 每秒清一次黑底 (30 帧), 非每帧; RGA 完整覆写视频区, 黑边不变 */
+            if (f->frame_nr % 30 == 0)
+                memset(f->back, 0, f->size);
+            /* RGA: 手动偏移指针到视频区, wstride=屏幕宽保证行距正确 */
+            uint8_t *dst = (uint8_t *)f->back + yoff * (int)f->w * 4 + xoff * 4;
+            if (rga_nv12_to_rgb(&f->rga, y, uv, dst, 0, 0) == 0)
+                goto write_fb;
         }
     }
 
@@ -213,7 +215,8 @@ void fb_show_nv12(fb_t *f, const uint8_t *y, const uint8_t *uv, int sw, int sh,
             return;
         }
         scale_nv12_nearest(y, uv, sw, sh, y_stride, sy, suv, dw, dh);
-        memset(f->back, 0, f->size);
+        if (f->frame_nr % 30 == 0)
+            memset(f->back, 0, f->size);
         nv12_to_rgb888(sy, suv, dw, dh, dw, (uint32_t *)f->back, f->w);
         free(sy);
         free(suv);
@@ -221,7 +224,8 @@ void fb_show_nv12(fb_t *f, const uint8_t *y, const uint8_t *uv, int sw, int sh,
         /* 直接转换（源 ≤ 目标尺寸） */
         dw = sw < (int)f->w ? sw : (int)f->w;
         dh = sh < (int)f->h ? sh : (int)f->h;
-        memset(f->back, 0, f->size);
+        if (f->frame_nr % 30 == 0)
+            memset(f->back, 0, f->size);
         nv12_to_rgb888(y, uv, dw, dh, y_stride, (uint32_t *)f->back, f->w);
     }
 

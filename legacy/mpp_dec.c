@@ -1,15 +1,12 @@
 /*
- * mpp_dec.c — Rockchip MPP H.264 硬解码封装
+ * ❌ 废弃 — MPP 裸 API 解码封装 (仅 main_native.c 使用)
  *
  * 参考: rockchip-linux/mpp/test/mpi_dec_test.c (官方 demo, dec_simple 模式)
  *
- * 解码流程:
- *   1. mpp_create → mpp_init(MPP_CTX_DEC, MPP_VIDEO_CodingAVC)
- *   2. split_parse=1: MPP 内部处理 NAL 拆分
- *   3. 设置输入超时 + 码流缓冲属性
- *   4. 循环: decode_put_packet(帧数据) → decode_get_frame(NV12)
- *   5. info_change 时: 申请 buffer group → SET_EXT_BUF_GROUP →
- * SET_INFO_CHANGE_READY
+ * 注意: 函数名已改为 mpphw_* 前缀, 避免与 librockchip_mpp.so 导出的
+ * mpp_dec_init/mpp_dec_deinit/mpp_dec_decode 符号冲突 → 无限递归栈溢出
+ *
+ * 正式方案使用 GStreamer mppvideodec 插件, 不经过本文件
  */
 
 #include "mpp_dec.h"

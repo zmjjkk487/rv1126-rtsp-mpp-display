@@ -1,3 +1,5 @@
+/* ✅ 主方案 — fbdev 显示 + RGA 硬转, main.c 使用 */
+
 #ifndef FBDEV_H
 #define FBDEV_H
 
@@ -15,6 +17,7 @@ typedef struct {
     uint8_t *back;
     rga_ctx_t rga; /* RGA 转换上下文 */
     int rga_ok;    /* RGA 是否可用 */
+    int frame_nr;  /* 帧计数, 清屏节流用 (每 30 帧清一次) */
 } fb_t;
 
 int fb_init(fb_t *f, const char *device);

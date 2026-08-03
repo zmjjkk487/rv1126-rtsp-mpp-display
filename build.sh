@@ -1,5 +1,5 @@
 #!/bin/bash
-# RV1126 GStreamer + RGA 混合管线 — 交叉编译
+# ✅ 主方案编译 — GStreamer + RGA 混合管线 (推荐)
 # 管道: rtspsrc → depay → parse → mppvideodec → appsink(NV12) → RGA → fbdev
 
 set -e

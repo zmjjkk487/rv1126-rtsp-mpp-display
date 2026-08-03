@@ -1,10 +1,8 @@
 /*
- * drm_display.c — Linux DRM/KMS 显示实现
+ * 🔬 实验 — DRM/KMS 显示 (未完成, RGA 未集成, 不编译)
  *
- * 使用 DRM dumb buffer 进行简单帧缓冲显示。
- * vsync / page flip 等高级特性暂未启用，保持与 fbdev 接口兼容。
- *
- * 参考: libdrm 自带的 modetest.c
+ * 当前正式方案使用 fbdev (fbdev.c), 更简单稳定。
+ * 如需 DRM: 需实现 page flip + RGA dma-buf 导入, 工作量较大。
  */
 
 #include "drm_display.h"

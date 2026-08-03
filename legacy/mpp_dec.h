@@ -1,3 +1,5 @@
+/* ❌ 废弃 — 仅 main_native.c 使用, 正式方案不经过本文件 */
+
 #ifndef MPP_DEC_H
 #define MPP_DEC_H
 
