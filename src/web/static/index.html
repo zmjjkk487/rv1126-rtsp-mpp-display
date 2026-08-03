@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>摄像头管理</title>
+<script src="hls.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font:14px/1.5 system-ui,sans-serif;background:#0a0e17;color:#e0e6ed;max-width:800px;margin:0 auto;padding:20px}
+h1{font-size:24px;margin-bottom:4px}
+.sub{color:#64748b;font-size:13px;margin-bottom:20px}
+.card{background:#141a24;border:1px solid #1e293b;border-radius:12px;padding:16px;margin-bottom:14px}
+.card:hover{border-color:#334155}
+.card h3{font-size:16px;margin-bottom:6px}
+.card .meta{color:#94a3b8;font-size:12px;word-break:break-all}
+.btn{padding:8px 20px;border:none;border-radius:6px;cursor:pointer;font-size:13px;margin-right:8px;margin-top:8px}
+.btn-primary{background:#1d4ed8;color:#fff}
+.btn-primary:hover{background:#2563eb}
+.btn-danger{background:#991b1b;color:#fff}
+.btn-success{background:#166534;color:#fff}
+.status{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+.status-red{background:#ef4444}
+.status-green{background:#22c55e}
+.status-yellow{background:#eab308;animation:pulse 1s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
+input,select{width:100%;padding:8px 12px;border:1px solid #334155;border-radius:6px;background:#1a1f2e;color:#e0e6ed;font-size:13px;margin-top:6px}
+label{font-size:12px;color:#94a3b8;margin-top:10px;display:block}
+.tab{display:flex;gap:8px;margin-bottom:16px}
+.tab button{flex:1;padding:8px;border:1px solid #334155;border-radius:8px;background:transparent;color:#94a3b8;cursor:pointer;font-size:13px}
+.tab button.active{background:rgba(56,189,248,0.12);border-color:#38bdf8;color:#e0e6ed}
+.hidden{display:none}
+pre{background:#0a0e17;padding:10px;border-radius:8px;overflow-x:auto;font-size:12px;color:#38bdf8}
+</style>
+</head>
+<body>
+
+<h1>&#x1F4F7; 摄像头管理</h1>
+<p class="sub">自动发现局域网 ONVIF 摄像头 &middot; 一点即连</p>
+
+<div class="tab">
+  <button id="tab-scan" class="active" onclick="showTab('scan')">&#x1F50D; 扫描发现</button>
+  <button id="tab-connect" onclick="showTab('connect')">&#x1F517; 手动连接</button>
+  <button id="tab-preview" onclick="showTab('preview')">&#x1F4FA; 预览</button>
+  <button id="tab-status" onclick="showTab('status')">&#x2139;&#xFE0F; 状态</button>
+</div>
+
+<!-- 预览面板 -->
+<div id="panel-preview" class="hidden">
+  <div class="card">
+    <h3>&#x1F4FA; 视频预览</h3>
+    <p class="meta">浏览器实时预览 (GStreamer hlssink2 转 HLS, 约 3-5 秒延迟)</p>
+    <video id="preview-video" controls autoplay muted playsinline
+           style="width:100%;background:#000;border-radius:8px;margin-top:10px"></video>
+    <div style="margin-top:10px">
+      <button class="btn btn-danger" onclick="stopPreview()">&#9632; 停止预览</button>
+    </div>
+  </div>
+</div>
+
+<!-- 扫描面板 -->
+<div id="panel-scan">
+  <div class="card">
+    <h3>&#x1F50D; 正在扫描局域网...</h3>
+    <p class="meta">组播探测 + ONVIF 协议, 首次扫描约 10 秒</p>
+    <button class="btn btn-primary" onclick="doScan()">&#x1F504; 重新扫描</button>
+    <div id="scan-result"></div>
+  </div>
+</div>
+
+<!-- 手动连接面板 -->
+<div id="panel-connect" class="hidden">
+  <div class="card">
+    <h3>&#x1F517; 手动输入 RTSP 地址</h3>
+    <label>RTSP 地址</label>
+    <input id="manual-url" placeholder="rtsp://admin:123456@192.168.50.168:554/stream0">
+    <label>用户名 (可选)</label>
+    <input id="manual-user" placeholder="admin">
+    <label>密码 (可选)</label>
+    <input id="manual-pass" type="password" placeholder="">
+    <button class="btn btn-success" onclick="doConnect(document.getElementById('manual-url').value,
+      document.getElementById('manual-user').value,
+      document.getElementById('manual-pass').value)">&#x25B6; 连接</button>
+  </div>
+</div>
+
+<!-- 状态面板 -->
+<div id="panel-status" class="hidden">
+  <div class="card">
+    <h3>&#x2139;&#xFE0F; 系统状态</h3>
+    <div id="status-info"><span class="status status-yellow"></span> 检查中...</div>
+  </div>
+</div>
+
+<script>
+function showTab(tab) {
+  ['scan','connect','preview','status'].forEach(t => {
+    document.getElementById('panel-'+t).classList.add('hidden');
+    document.getElementById('tab-'+t).classList.remove('active');
+  });
+  document.getElementById('panel-'+tab).classList.remove('hidden');
+  document.getElementById('tab-'+tab).classList.add('active');
+  if (tab === 'status') checkStatus();
+  if (tab === 'scan' && !document.getElementById('scan-result').innerHTML) doScan();
+}
+
+// HLS 预览
+let hlsPlayer = null;
+function startPreview(rtspUrl) {
+  if (!rtspUrl) { alert('该码流无 RTSP 地址'); return; }
+  showTab('preview');
+  document.getElementById('preview-video').src = '';
+  document.getElementById('preview-video').load();
+  if (hlsPlayer) { hlsPlayer.destroy(); hlsPlayer = null; }
+
+  fetch('/api/hls_start', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({url: rtspUrl})
+  }).then(r => r.json()).then(d => {
+    if (d.status !== 'ok') { alert('启动预览失败: '+JSON.stringify(d)); return; }
+    // 等 5 秒让 GStreamer 生成前几个分片
+    setTimeout(() => {
+      let video = document.getElementById('preview-video');
+      let hlsUrl = window.location.origin + '/hls/stream.m3u8';
+      if (window.Hls && window.Hls.isSupported()) {
+        hlsPlayer = new Hls({
+          liveDurationInfinity: true,
+          liveSyncDurationCount: 3,
+          maxBufferLength: 10
+        });
+        hlsPlayer.loadSource(hlsUrl);
+        hlsPlayer.attachMedia(video);
+        hlsPlayer.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(()=>{}));
+        // fatal 错误自动重试一次, 不再直接弹窗
+        let retried = false;
+        hlsPlayer.on(Hls.Events.ERROR, (e, data) => {
+          if (!data.fatal) return;
+          if (data.type === 'networkError' && !retried) {
+            retried = true;
+            setTimeout(() => { hlsPlayer.destroy(); hlsPlayer = new Hls({liveDurationInfinity:true}); hlsPlayer.loadSource(hlsUrl); hlsPlayer.attachMedia(video); }, 2000);
+            return;
+          }
+          alert('预览出错: '+data.type+' ('+(data.details||'')+')');
+          stopPreview();
+        });
+      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        // Safari 原生 HLS
+        video.src = hlsUrl;
+        video.play().catch(()=>{});
+      } else {
+        alert('浏览器不支持 HLS 播放');
+      }
+    }, 3000);
+  }).catch(e => alert('启动预览失败: '+e.message));
+}
+
+function stopPreview() {
+  if (hlsPlayer) { hlsPlayer.destroy(); hlsPlayer = null; }
+  let video = document.getElementById('preview-video');
+  video.pause(); video.src = ''; video.load();
+  fetch('/api/hls_stop', {method: 'POST'}).catch(()=>{});
+}
+
+function checkStatus() {
+  fetch('/api/status').then(r=>r.json()).then(d=>{
+    let el = document.getElementById('status-info');
+    if (d.running) {
+      el.innerHTML = '<span class="status status-green"></span> 管线运行中 (PID: '+d.pid+')';
+    } else {
+      el.innerHTML = '<span class="status status-red"></span> 管线未运行';
+    }
+  }).catch(e=>{
+    document.getElementById('status-info').innerHTML = '<span class="status status-red"></span> 无法连接服务';
+  });
+}
+
+async function doScan() {
+  let el = document.getElementById('scan-result');
+  el.innerHTML = '<p style="margin-top:12px"><span class="status status-yellow"></span> 扫描中... 请稍候（约 10 秒）</p>';
+  try {
+    let r = await fetch('/api/scan');
+    let d = await r.json();
+    if (!d.devices || d.devices.length === 0) {
+      el.innerHTML = '<p style="margin-top:12px;color:#f59e0b">未发现 ONVIF 设备。请确认摄像头已开机且在同一局域网。</p>';
+      return;
+    }
+    let html = '<p style="margin-top:12px">发现 <b>'+d.count+'</b> 台设备:</p>';
+    // 记住设备列表 (PTZ 用)
+    window.devices = d.devices;
+    d.devices.forEach((dev,i) => {
+      let profHTML = '';
+      if (dev.profiles && dev.profiles.length > 0) {
+        profHTML += '<div style="margin:8px 0 4px">'+
+          '<div style="display:flex;gap:6px">'+
+          '<input id="cred-user-'+i+'" value="admin" placeholder="账号" style="flex:1;font-size:12px">'+
+          '<input id="cred-pass-'+i+'" value="" placeholder="密码" type="password" style="flex:1;font-size:12px">'+
+          '</div></div>';
+        dev.profiles.forEach(p => {
+          let label = p.name || p.token;
+          if (p.width) label += ' ('+p.width+'x'+p.height+')';
+          profHTML += '<div style="margin:4px 0">'+
+            '<span style="font-size:12px">'+label+'</span><br>'+
+            (p.uri ? '<input value="'+p.uri+'" readonly style="width:100%;font-size:11px;margin:2px 0" onclick="this.select()">' : '')+
+            '<button class="btn btn-primary" style="font-size:11px;padding:4px 12px" onclick="doConnectWithCreds('+
+            i+',\''+(p.uri||'')+'\')">&#x25B6; '+
+            ((p.name||'').toLowerCase().indexOf('sub')>=0 ? '子码流' : '主码流')+'</button>'+
+            '<button class="btn" style="font-size:11px;padding:4px 12px;background:#1d4ed8;color:#fff;border:none;border-radius:6px;margin-left:6px;cursor:pointer" onclick="startPreview(\''+(p.uri||'')+'\')">&#x1F4FA; 预览</button>'+
+            '</div>';
+        });
+      }
+      html += '<div class="card">'+
+        '<h3>&#x1F4F7; '+dev.name+'</h3>'+
+        '<div class="meta">IP: '+dev.ip+' | 服务: '+dev.xaddrs+'</div>'+
+        profHTML+
+        '</div>';
+    });
+    el.innerHTML = html;
+  } catch(e) {
+    el.innerHTML = '<p style="margin-top:12px;color:#ef4444">扫描失败: '+e.message+'</p>';
+  }
+}
+
+// 用设备对应的凭据输入框连接 (devIndex 是设备在列表中的序号)
+function doConnectWithCreds(devIndex, url) {
+  let u = document.getElementById('cred-user-'+devIndex).value;
+  let p = document.getElementById('cred-pass-'+devIndex).value;
+  doConnect(url, u, p);
+}
+
+async function doConnect(url, user, pass) {
+  if (!url) { alert('请输入 RTSP 地址'); return; }
+  try {
+    let r = await fetch('/api/connect', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({url: url, user: user||'admin', pass: pass||''})
+    });
+    let d = await r.json();
+    if (d.status === 'ok') {
+      alert('连接成功! 管线已启动 (PID: '+d.pid+')');
+    } else {
+      alert('连接失败: '+JSON.stringify(d));
+    }
+  } catch(e) {
+    alert('请求失败: '+e.message);
+  }
+}
+
+// 页面加载时自动扫描
+doScan();
+setInterval(checkStatus, 10000);
+</script>
+</body>
+</html>

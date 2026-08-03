@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Lesson 1 — 数据流动全景图</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<h1>📐 Lesson 1：数据流动全景图</h1>
+<p><strong>教学目标</strong>：闭眼能讲出从摄像头到屏幕的 8 段数据链路，知道每一段数据长什么样。</p>
+
+<h2>你项目的完整链路</h2>
+
+<div class="diagram">
+<pre style="background:#fff;text-align:center;line-height:2.4;font-size:1em">
+🌐 <b>摄像头</b>
+ │  <span class="tag tag-hw">H.264 编码</span> 光→电→压缩
+ │  1920×1080 YUV → 4Mbps H.264 码流
+ ▼
+📡 <b>网络</b>
+ │  <span class="tag tag-fmt">RTP 分包</span>  H.264 NAL → RTP 包 (MTU 1500)
+ │  每帧 ~10-50 个 UDP/TCP 包
+ ▼
+🔌 <b>rtspsrc</b>
+ │  <span class="tag tag-sw">RTSP 握手 + 收包</span>  拼 RTP → 还原 H.264
+ │  输出: <code>video/x-h264, stream-format=avc</code>
+ ▼
+📦 <b>rtph264depay</b>
+ │  <span class="tag tag-sw">解 RTP 封装</span>  去 RTP 头, 重组 NAL 单元
+ │  输出: <code>video/x-h264, stream-format=byte-stream</code> (Annex-B)
+ ▼
+🔧 <b>h264parse</b>
+ │  <span class="tag tag-sw">解析 H.264 语法</span>  识别 SPS/PPS/IDR/P 帧
+ │  输出: <code>video/x-h264, parsed=true</code>
+ ▼
+🧠 <b>mppvideodec</b>
+ │  <span class="tag tag-hw">MPP 硬件解码</span>  H.264 → YUV420 (NV12)
+ │  1920×1080 压缩 → 3.1MB 原始帧 (VPU 硬件, ~0% CPU)
+ │  输出: <code>video/x-raw, format=NV12</code> (dmabuf)
+ ▼
+📥 <b>appsink</b>
+ │  <span class="tag tag-sw">取帧回调</span>  从 GStreamer 管线拉出一帧 NV12
+ │  GstVideoMeta 取真实 stride: hs=1920, vs=1088
+ ▼
+🎨 <b>RGA</b>
+ │  <span class="tag tag-hw">硬件颜色转换 + 缩放</span>  NV12 → BGRX_8888
+ │  1920×1080 → 720×405 (等比) + 黑边 720×1280
+ │  硬件 blit: ~2-4ms, ~0% CPU
+ ▼
+🖥️ <b>fbdev</b>
+ │  <span class="tag tag-sw">显存写入</span>  memcpy back→framebuffer mmap
+ │  720×1280×4 = 3.7MB/帧
+ ▼
+📱 <b>MIPI LCD</b>
+   屏幕显示 (720×1280, 32bpp)
+</pre>
+</div>
+
+<h2>关键数据格式在每个节点的变化</h2>
+
+<table>
+<tr><th>节点</th><th>格式</th><th>大小 (1080p)</th><th>硬件/软件</th></tr>
+<tr><td>摄像头输出</td><td>H.264 压缩流</td><td>~4 Mbps (~16KB/帧)</td><td>摄像头 ISP + 编码器</td></tr>
+<tr><td>rtspsrc → depay → parse</td><td>H.264 Annex-B</td><td>~16KB/帧</td><td>CPU (轻量)</td></tr>
+<tr><td>mppvideodec 输出</td><td><b>NV12</b> (Y + UV)</td><td>1920×1088×1.5 = <b>3.13 MB</b></td><td>VPU 硬件</td></tr>
+<tr><td>RGA 输出</td><td><b>BGRX_8888</b></td><td>720×1280×4 = <b>3.69 MB</b></td><td>RGA 硬件</td></tr>
+<tr><td>fbdev 写入</td><td>RGB (32bpp)</td><td>3.69 MB</td><td>CPU memcpy 3-10%</td></tr>
+</table>
+
+<div class="note">
+<strong>🔑 关键洞察</strong>：数据从 16KB（压缩）膨胀到 3.7MB（原始）→ <b>膨胀 ~230 倍</b>。这就是为什么需要硬件解码和硬件转换——纯 CPU 处理 3.7MB/帧 × 25fps = 92MB/s 的数据，Cortex-A7 根本扛不住。
+</div>
+
+<h2>你项目中的三条内存路径</h2>
+
+<div class="stage">
+<span class="tag tag-hw">硬件零拷贝</span> <strong>dmabuf 路径</strong>（实际在用）<br>
+MPP 输出 dmabuf → GStreamer 传 fd → appsink 取 GstVideoMeta → gst_buffer_map 取指针 → RGA 用 virAddr+mmuFlag 读 → RGA 写 back buffer。数据全程不经过 CPU 拷贝。
+</div>
+
+<div class="stage">
+<span class="tag tag-sw">CPU 回退</span> <strong>软件转换</strong>（RGA 不可用时）<br>
+MPP 输出 → CPU 读 NV12 → nv12_to_rgb888() 逐像素 BT.601 → 写 back buffer。1080p 下 ~80% CPU，作为紧急兜底。
+</div>
+
+<div class="stage">
+<span class="tag tag-fmt">帧缓冲</span> <strong>back buffer → 显存</strong>（每帧最后一跳）<br>
+RGA 写完 back buffer 后 → memcpy 到 /dev/fb0 mmap 映射的显存区域。这是物理上不可避免的一次拷贝（从 DDR 到显存控制器），约 1-3ms。
+</div>
+
+<h2>自测</h2>
+
+<div class="quiz">
+<h3>问题 1</h3>
+<p>1080p 视频每帧原始 NV12 数据多大？（四舍五入到 MB）</p>
+<button onclick="this.nextElementSibling.textContent='✗ 不对。NV12 = Y(全分辨率) + UV(半分辨率) = 1920×1088 + 1920×1088/2 = 3133440 字节 ≈ 3.1 MB。注意 ver_stride=1088 不是 1080。'">A) 2.1 MB</button>
+<button onclick="this.nextElementSibling.textContent='✓ 正确！NV12 = Y + UV/2 = 1920×1088×1.5 ≈ 3.1 MB。公式：hor_stride × ver_stride × 3/2'">B) 3.1 MB</button>
+<button onclick="this.nextElementSibling.textContent='✗ 不对。那是 BGRX 原始帧。NV12 是 YUV420 半平面，只有 1.5 字节/像素。'">C) 8.3 MB</button>
+<button onclick="this.nextElementSibling.textContent='✗ 不对。H.264 压缩后只有 ~16KB，解压后远大于此。'">D) 16 KB</button>
+<div class="feedback"></div>
+</div>
+
+<div class="quiz">
+<h3>问题 2</h3>
+<p>为什么背缓冲 (back buffer) 必须用屏幕宽度 (f-&gt;w) 做 RGA 行距，而不能用缩放宽度 (vw)？</p>
+<button onclick="this.nextElementSibling.textContent='✗ 不对。RGA 不关心显示分辨率，它只按你给的参数写。'">A) RGA 硬件要求</button>
+<button onclick="this.nextElementSibling.textContent='✗ 不对。memcpy 有问题，但 RGA 的 wstride 是在 RGA 写 back 时用的。'">B) memcpy 上屏需要对齐</button>
+<button onclick="this.nextElementSibling.textContent='✓ 正确。RGA 每行写 vw 像素后跳 wstride 字节到下一行。如果 wstride=vw 而缓冲实际行宽是 f->w，每行都会相对于上一行偏移 (f->w - vw) 像素 → 画面斜切变形。'">C) back buffer 每行宽度是 f-&gt;w，RGA 行距必须匹配</button>
+<button onclick="this.nextElementSibling.textContent='✗ 不对。memset 是清屏用的，跟行距无关。'">D) memset 需要整行宽度</button>
+<div class="feedback"></div>
+</div>
+
+<h2>下一步</h2>
+<p>下一课深入 <strong>NV12 颜色空间</strong>——Y 平面和 UV 平面怎么排布的？stride 对齐（16→1088）是怎么来的？为什么 offset 不对会出现"彩虹边"？</p>
+<p><a href="0002-nv12-color-space.html">→ Lesson 2: NV12 颜色空间与 stride 对齐</a></p>
+
+<div class="footer">
+<p>📖 推荐阅读：<a href="https://gstreamer.freedesktop.org/documentation/">GStreamer 官方文档</a> · <a href="https://github.com/rockchip-linux/mpp">Rockchip MPP 源码</a></p>
+<p>💬 有疑问？直接问我（你的 AI 老师），我会基于一手源码解答。</p>
+</div>
+
+</body>
+</html>

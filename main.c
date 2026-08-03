@@ -29,6 +29,52 @@ static GMainLoop *g_loop = NULL;
 static GstElement *g_pipeline = NULL;
 static int frame_count = 0;
 static fb_t g_fb;
+static config_t g_cfg;   /* 全局配置, 断线重连时重建管道用 */
+static int g_retry_delay = 2; /* 重连退避: 2s → 4s → 8s ... 封顶 30s */
+
+/* 前向声明 (restart_pipeline_cb 先于两者定义) */
+static GstElement *build_pipeline(const config_t *cfg);
+static gboolean on_bus_message(GstBus *bus, GstMessage *msg, gpointer data);
+
+/* 断线重连: 销毁旧管道, 延时后重建 (在主循环线程执行) */
+static gboolean restart_pipeline_cb(gpointer data) {
+    (void)data;
+
+    /* 每次重连重新读 config.ini: Web 后台可能已改 RTSP 地址,
+     * 用启动时的快照会导致永远连旧地址 */
+    config_parse(CONFIG_FILE, &g_cfg);
+
+    LOGI("重连中 (等待 %ds)...", g_retry_delay);
+    gst_element_set_state(g_pipeline, GST_STATE_NULL);
+    gst_object_unref(g_pipeline);
+    g_pipeline = NULL;
+
+    /* 重建管道 */
+    g_pipeline = build_pipeline(&g_cfg);
+    if (!g_pipeline) {
+        LOGE("管道重建失败, 再次重试");
+        g_timeout_add_seconds(g_retry_delay, restart_pipeline_cb, NULL);
+        if (g_retry_delay < 30) g_retry_delay *= 2;
+        return G_SOURCE_REMOVE;
+    }
+
+    GstBus *bus = gst_element_get_bus(g_pipeline);
+    gst_bus_add_watch(bus, on_bus_message, NULL);
+    gst_object_unref(bus);
+
+    GstStateChangeReturn ret =
+        gst_element_set_state(g_pipeline, GST_STATE_PLAYING);
+    if (ret == GST_STATE_CHANGE_FAILURE) {
+        LOGE("管道重启失败, 再次重试");
+        g_timeout_add_seconds(g_retry_delay, restart_pipeline_cb, NULL);
+        if (g_retry_delay < 30) g_retry_delay *= 2;
+        return G_SOURCE_REMOVE;
+    }
+
+    LOGI("管道已重启, 恢复播放");
+    g_retry_delay = 2; /* 成功恢复后重置退避 */
+    return G_SOURCE_REMOVE;
+}
 
 /* GStreamer bus 消息回调 */
 static gboolean on_bus_message(GstBus *bus, GstMessage *msg, gpointer data) {
@@ -37,19 +83,19 @@ static gboolean on_bus_message(GstBus *bus, GstMessage *msg, gpointer data) {
 
     switch (GST_MESSAGE_TYPE(msg)) {
     case GST_MESSAGE_EOS:
-        LOGI("GStreamer: 流结束 (EOS)");
-        g_main_loop_quit(g_loop);
+        LOGW("GStreamer: 流结束 (EOS), 准备重连");
+        g_timeout_add_seconds(g_retry_delay, restart_pipeline_cb, NULL);
         break;
     case GST_MESSAGE_ERROR: {
         GError *err = NULL;
         gchar *dbg = NULL;
         gst_message_parse_error(msg, &err, &dbg);
-        LOGE("GStreamer 错误: %s", err->message);
+        LOGW("GStreamer 错误: %s, 准备重连", err->message);
         if (dbg)
             LOGD("调试: %s", dbg);
         g_error_free(err);
         g_free(dbg);
-        g_main_loop_quit(g_loop);
+        g_timeout_add_seconds(g_retry_delay, restart_pipeline_cb, NULL);
         break;
     }
     case GST_MESSAGE_WARNING: {
@@ -266,9 +312,8 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    config_t cfg;
-    config_parse(cfg_path, &cfg);
-    log_set_level(cfg.log_level);
+    config_parse(cfg_path, &g_cfg);
+    log_set_level(g_cfg.log_level);
 
     FILE *lf = fopen("/var/log/rv1126_gst.log", "a");
     log_set_file(lf);
@@ -277,7 +322,7 @@ int main(int argc, char *argv[]) {
     LOGI("========================================");
     LOGI("RV1126 GStreamer RTSP 解码显示 Demo");
     LOGI("========================================");
-    LOGI("RTSP: %s", cfg.rtsp_url);
+    LOGI("RTSP: %s", g_cfg.rtsp_url);
     LOGI("管道: rtspsrc → depay → parse → mppvideodec → appsink(NV12) → RGA → fbdev");
 
     /* 初始化 GStreamer */
@@ -288,14 +333,14 @@ int main(int argc, char *argv[]) {
     signal(SIGTERM, on_signal);
 
     /* 初始化显示设备 (RGA + fbdev) */
-    LOGI("初始化 fbdev (%s)...", cfg.fb_device);
-    if (fb_init(&g_fb, cfg.fb_device) < 0) {
+    LOGI("初始化 fbdev (%s)...", g_cfg.fb_device);
+    if (fb_init(&g_fb, g_cfg.fb_device) < 0) {
         if (lf) fclose(lf);
         return 1;
     }
 
     /* 构建管道 */
-    g_pipeline = build_pipeline(&cfg);
+    g_pipeline = build_pipeline(&g_cfg);
     if (!g_pipeline) {
         LOGE("管道构建失败");
         if (lf)

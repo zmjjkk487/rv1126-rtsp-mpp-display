@@ -1,0 +1,53 @@
+# 数据流管线速查表
+
+## 完整链路 (记忆口诀: 网解变渲 → 4 段)
+
+```
+摄像头 H.264 → RTP 分包 → RTSP 握手 → depay 拼包 → parse 解析
+→ MPP 硬解(YUV) → appsink 取帧 → RGA 硬转(RGB) → fbdev 上屏
+```
+
+## 各节点数据格式
+
+| # | 节点 | 输入格式 | 输出格式 | 典型大小 | CPU |
+|---|------|---------|---------|---------|-----|
+| 1 | 摄像头 | 光信号 | H.264 码流 | ~4Mbps | — |
+| 2 | rtspsrc | RTP 包 | H.264 AVC | 16KB/帧 | 低 |
+| 3 | rtph264depay | RTP 封装 | H.264 Annex-B | 16KB/帧 | 低 |
+| 4 | h264parse | H.264 裸流 | H.264 parsed | 16KB/帧 | 低 |
+| 5 | mppvideodec | H.264 | NV12 (dmabuf) | 3.1MB/帧 | ~0% |
+| 6 | appsink | NV12 dmabuf | CPU 指针 | 3.1MB | ~0% |
+| 7 | RGA | NV12 | BGRX_8888 | 3.7MB/帧 | ~0% |
+| 8 | fbdev | BGRX back | 显存 | 3.7MB | 3-10% |
+
+## NV12 内存布局
+
+```
+Y 平面: hor_stride × ver_stride 字节 (每像素 1 字节)
+UV 平面: 紧随 Y 之后, hor_stride × ver_stride / 2 字节 (每 2×2 块共享 UV)
+总大小 = hor_stride × ver_stride × 3 / 2
+```
+
+## BGRX_8888 内存布局
+
+```
+每像素 4 字节: [B][G][R][X] (X=padding, 0xFF)
+按行: dst[y][x] = back_base + y * w * 4 + x * 4
+```
+
+## MPP stride 对齐规则
+
+| 分辨率 | hor_stride | ver_stride | 原因 |
+|--------|-----------|-----------|------|
+| 704×576 | 704 | 576 | 704=64×11, 576=16×36, 已对齐 |
+| 1920×1080 | 1984 | 1088 | 1984=ALIGN(1920,64)+64(padding), 1088=ALIGN(1080,16) |
+
+## 关键 API 对应
+
+| 功能 | GStreamer 路径 (正式) | 原生路径 (废弃) |
+|------|----------------------|-----------------|
+| 拉流 | rtspsrc (GstElement) | avformat_open_input |
+| 解码 | mppvideodec (插件) | mpphw_dec_decode |
+| 取帧 | appsink + GstVideoMeta | decode_get_frame |
+| 转换 | rga_nv12_to_rgb | 同 (共用) |
+| 显示 | fb_show_nv12 → memcpy | 同 (共用) |

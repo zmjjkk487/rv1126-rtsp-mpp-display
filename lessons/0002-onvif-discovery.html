@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Lesson 2 — ONVIF 摄像头自动发现原理</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<h1>&#x1F4E1; Lesson 2：ONVIF 摄像头自动发现原理</h1>
+
+<p><strong>问题</strong>：客户拿到板子，不知道摄像头的 RTSP 地址填什么。<br>
+<strong>目标</strong>：板子上电 → 自动扫描局域网 → 列出所有摄像头 → 客户点一下就能看画面。</p>
+
+<h2>ONVIF 是什么</h2>
+
+<p>ONVIF = Open Network Video Interface Forum。一个行业协会标准，<strong>几乎所有 IP 摄像头都支持</strong>。</p>
+<p>它定义了一套基于 SOAP/XML 的 Web Service 协议，让你可以：发现摄像头、获取 RTSP 地址、控制云台、修改配置。</p>
+
+<div class="stage">
+<span class="tag tag-hw">核心原理</span>
+ONVIF 建立在三个标准协议之上：
+<br>① <strong>WS-Discovery</strong> (UDP 组播) — 在局域网里找到摄像头
+<br>② <strong>SOAP/XML</strong> (HTTP POST) — 向摄像头请求 RTSP 地址
+<br>③ <strong>WS-Security</strong> (HTTP Header) — 用户名密码认证
+</div>
+
+<h2>第一步：WS-Discovery 发现摄像头</h2>
+
+<h3>原理：发一条 UDP 广播，摄像头回复自己的信息</h3>
+
+<div class="diagram">
+<pre>
+板子 (192.168.50.132)                  摄像头 (192.168.50.168)
+    │                                        │
+    │  UDP → 239.255.255.250:3702             │
+    │  SOAP Probe: "谁支持 ONVIF？"            │
+    │ ─────────────────────────────────────→  │
+    │                                        │
+    │           UDP ← 192.168.50.168:3702     │
+    │           SOAP ProbeMatch:               │
+    │           "我是海康 DS-2CD1021,          │
+    │            我的服务在                      │
+    │            http://192.168.50.168/onvif/   │
+    │                      device_service"      │
+    │  ←───────────────────────────────────── │
+</pre>
+</div>
+
+<h3>实际发送的 XML（你的 C 代码要构造这个）</h3>
+
+<pre>&lt;?xml version="1.0" encoding="utf-8"?&gt;
+&lt;e:Envelope
+  xmlns:e="http://www.w3.org/2003/05/soap-envelope"
+  xmlns:w="http://schemas.xmlsoap.org/ws/2004/08/addressing"
+  xmlns:d="http://docs.oasis-open.org/ws-dd/ns/discovery/2009/01"
+  xmlns:dn="http://www.onvif.org/ver10/network/wsdl"&gt;
+  &lt;e:Header&gt;
+    &lt;w:MessageID&gt;uuid:1234567890-abcd&lt;/w:MessageID&gt;
+    &lt;w:To&gt;urn:docs-oasis-open-org:ws-dd:ns:discovery:2009:01&lt;/w:To&gt;
+    &lt;w:Action&gt;http://docs.oasis-open.org/ws-dd/ns/discovery/2009/01/Probe&lt;/w:Action&gt;
+  &lt;/e:Header&gt;
+  &lt;e:Body&gt;
+    &lt;d:Probe&gt;
+      &lt;d:Types&gt;dn:NetworkVideoTransmitter&lt;/d:Types&gt;
+    &lt;/d:Probe&gt;
+  &lt;/e:Body&gt;
+&lt;/e:Envelope&gt;
+</pre>
+
+<p>这条 XML 通过 <strong>UDP socket 发到 239.255.255.250 端口 3702</strong>。这是一个组播地址——同网段所有 ONVIF 设备都会收到。</p>
+
+<h3>摄像头回复的内容（你的 C 代码要解析这个）</h3>
+
+<pre>&lt;e:Envelope ...&gt;
+  &lt;e:Body&gt;
+    &lt;d:ProbeMatches&gt;
+      &lt;d:ProbeMatch&gt;
+        &lt;w:EndpointReference&gt;
+          &lt;w:Address&gt;<strong>urn:uuid:7e2a1b3c-...</strong>&lt;/w:Address&gt;
+        &lt;/w:EndpointReference&gt;
+        &lt;d:Types&gt;dn:NetworkVideoTransmitter&lt;/d:Types&gt;
+        &lt;d:<strong>XAddrs</strong>&gt;
+          <strong>http://192.168.50.168/onvif/device_service</strong>
+        &lt;/d:XAddrs&gt;
+        &lt;d:MetadataVersion&gt;1&lt;/d:MetadataVersion&gt;
+      &lt;/d:ProbeMatch&gt;
+    &lt;/d:ProbeMatches&gt;
+  &lt;/e:Body&gt;
+&lt;/e:Envelope&gt;
+</pre>
+
+<p>核心字段就一个：<code>XAddrs</code> — 摄像头的 ONVIF 服务地址。拿到这个，第二步就有目标了。</p>
+
+<h3>兼容性技巧（来自生产项目）</h3>
+
+<table>
+<tr><th>问题</th><th>解法</th></tr>
+<tr><td>不同厂商用不同 WS-Discovery 版本</td><td>同时发 6 种 Probe（2005×2009×3 类 Type）</td></tr>
+<tr><td>部分摄像头不响应组播</td><td>额外单播扫同网段 254 个 IP</td></tr>
+<tr><td>XAddrs 可能包含多个 URL</td><td>优先选含 <code>/onvif/device_service</code> 的那个</td></tr>
+<tr><td>重复响应</td><td>按 XAddrs host 去重</td></tr>
+</table>
+
+<h2>第二步：获取 RTSP 地址</h2>
+
+<p>拿到 <code>http://192.168.50.168/onvif/device_service</code> 后，发 HTTP POST（Content-Type: application/soap+xml）。</p>
+
+<h3>2a. GetCapabilities — 问摄像头支持什么功能</h3>
+
+<pre>POST /onvif/device_service HTTP/1.1
+SOAPAction: http://www.onvif.org/ver10/device/wsdl/GetCapabilities
+
+&lt;s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"&gt;
+  &lt;s:Body&gt;
+    &lt;tds:GetCapabilities xmlns:tds="http://www.onvif.org/ver10/device/wsdl"&gt;
+      &lt;tds:Category&gt;All&lt;/tds:Category&gt;
+    &lt;/tds:GetCapabilities&gt;
+  &lt;/s:Body&gt;
+&lt;/s:Envelope&gt;
+</pre>
+
+<p>返回 XML 里找 <code>&lt;tt:Media&gt;&lt;tt:XAddrs&gt;http://...</code> — 这是媒体服务的地址。</p>
+
+<h3>2b. GetProfiles — 列出所有码流配置</h3>
+
+<pre>POST /onvif/Media HTTP/1.1
+SOAPAction: http://www.onvif.org/ver10/media/wsdl/GetProfiles
+
+&lt;s:Envelope ...&gt;
+  &lt;s:Body&gt;
+    &lt;trt:GetProfiles xmlns:trt="http://www.onvif.org/ver10/media/wsdl"/&gt;
+  &lt;/s:Body&gt;
+&lt;/s:Envelope&gt;
+</pre>
+
+<p>返回每个 profile 的 token + name（如 "mainStream"/"subStream"）+ 分辨率。</p>
+
+<h3>2c. GetStreamUri — 获取实际 RTSP URL</h3>
+
+<pre>POST /onvif/Media HTTP/1.1
+SOAPAction: http://www.onvif.org/ver10/media/wsdl/GetStreamUri
+
+&lt;s:Envelope ...&gt;
+  &lt;s:Body&gt;
+    &lt;trt:GetStreamUri xmlns:trt="http://www.onvif.org/ver10/media/wsdl"&gt;
+      &lt;trt:StreamSetup&gt;
+        &lt;tt:Stream xmlns:tt="http://www.onvif.org/ver10/schema"&gt;RTP-Unicast&lt;/tt:Stream&gt;
+        &lt;tt:Transport xmlns:tt="http://www.onvif.org/ver10/schema"&gt;
+          &lt;tt:Protocol&gt;RTSP&lt;/tt:Protocol&gt;
+        &lt;/tt:Transport&gt;
+      &lt;/trt:StreamSetup&gt;
+      &lt;trt:ProfileToken&gt;profile1&lt;/trt:ProfileToken&gt;
+    &lt;/trt:GetStreamUri&gt;
+  &lt;/s:Body&gt;
+&lt;/s:Envelope&gt;
+</pre>
+
+<p>返回 <code>&lt;tt:Uri&gt;rtsp://192.168.50.168:554/stream0&lt;/tt:Uri&gt;</code></p>
+
+<div class="note">
+<strong>&#x1F4A1; 实际只需要三步</strong>：Probe → GetProfiles → GetStreamUri。<br>
+大多数摄像头 GetCapabilities 可以跳过（media 地址就是 <code>/onvif/Media</code>）。
+</div>
+
+<h2>认证：如果摄像头有密码？</h2>
+
+<p>在 SOAP Header 里加上 WS-Security UsernameToken：</p>
+
+<pre>&lt;s:Header&gt;
+  &lt;Security xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"&gt;
+    &lt;UsernameToken&gt;
+      &lt;Username&gt;admin&lt;/Username&gt;
+      &lt;Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest"&gt;
+        <!-- SHA1(nonce + created + password) 的 Base64 -->
+      &lt;/Password&gt;
+      &lt;Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary"&gt;
+        <!-- 随机 16 字节 -->
+      &lt;/Nonce&gt;
+      &lt;Created xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"&gt;
+        2024-01-01T00:00:00Z
+      &lt;/Created&gt;
+    &lt;/UsernameToken&gt;
+  &lt;/Security&gt;
+&lt;/s:Header&gt;
+</pre>
+
+<p>但很多摄像头也接受 <strong>HTTP Basic Auth</strong>（<code>Authorization: Basic base64(user:pass)</code>），更简单。先试 Basic，失败再上 WS-Security。</p>
+
+<h2>C 实现的可行方案</h2>
+
+<div class="stage">
+<span class="tag tag-fmt">最小实现</span> 约 500 行 C 代码：
+<br>① UDP socket → sendto(239.255.255.250:3702, Probe XML)
+<br>② recvfrom + strstr() 解析 XAddrs
+<br>③ HTTP POST (BSD socket) → GetProfiles → GetStreamUri
+<br>④ libcurl 解析 RTSP URL（或者自己手写 HTTP）
+<br><strong>零额外依赖</strong>，板上已有 curl。
+</div>
+
+<h2>自测</h2>
+
+<div class="quiz">
+<h3>问题 1</h3>
+<p>WS-Discovery Probe 消息发到哪个地址？</p>
+<button onclick="this.nextElementSibling.textContent='&#x2717; 这是 TCP，WS-Discovery 用 UDP 组播'">A) 192.168.1.255:80</button>
+<button onclick="this.nextElementSibling.textContent='&#x2717; 端口和 IP 都不对'">B) 224.0.0.1:8080</button>
+<button onclick="this.nextElementSibling.textContent='&#x2717; 这是广播地址，Discovery 用组播 239.255.255.250'">C) 255.255.255.255:3702</button>
+<button onclick="this.nextElementSibling.textContent='&#x2713; 正确。WS-Discovery 标准组播地址 239.255.255.250:3702'">D) 239.255.255.250:3702</button>
+<div class="feedback"></div>
+</div>
+
+<div class="quiz">
+<h3>问题 2</h3>
+<p>从一堆 SOAP 回复中，哪个字段告诉我们摄像头的服务地址？</p>
+<button onclick="this.nextElementSibling.textContent='&#x2713; 对。XAddrs 包含空格分隔的 URL 列表，优先选 /onvif/device_service'">A) XAddrs</button>
+<button onclick="this.nextElementSibling.textContent='&#x2717; Address 是 UUID 标识符，不是 IP 地址'">B) Address</button>
+<button onclick="this.nextElementSibling.textContent='&#x2717; Types 是设备类型声明，不含地址'">C) Types</button>
+<button onclick="this.nextElementSibling.textContent='&#x2717; MetadataVersion 是版本号'">D) MetadataVersion</button>
+<div class="feedback"></div>
+</div>
+
+<div class="footer">
+<p>&#x1F4D6; 参考来源：ONVIF Core Specification v2.0、ONVIF Media Service WSDL、生产项目 /tmp/t113_ref</p>
+<p>&#x1F4AC; 下一课：<a href="0003-onvif-c-implementation.html">C 实现 — 从 UDP socket 到 RTSP URL</a></p>
+</div>
+
+</body>
+</html>

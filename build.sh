@@ -4,7 +4,8 @@
 
 set -e
 
-PROJECT="rv1126_gst_display"
+# 进程名 ≤15 字符 (Linux comm 截断限制), 否则 killall/pgrep/pidof 匹配不到
+PROJECT="rtsp_display"
 OUTDIR="output"
 BIN="$OUTDIR/$PROJECT"
 
@@ -49,4 +50,23 @@ echo "板端运行:"
 echo "  ./$PROJECT config.ini"
 echo ""
 echo "管道: rtspsrc → depay → parse → mppvideodec → appsink → RGA → fbdev"
+echo "============================================"
+
+# ---- Web 管理后台 (ONVIF 发现) ----
+WEB_BIN="$OUTDIR/rv1126_web"
+echo ""
+echo "编译 Web 管理后台..."
+WEB_CFLAGS="--sysroot=$SYSROOT -Wall -O2 -g -std=c11 $CFLAGS"
+WEB_LDFLAGS="--sysroot=$SYSROOT -L$SYSROOT/usr/lib -lcurl -lcrypto -lm"
+WEB_SRCS="src/web/web_main.c src/web/onvif_disco.c src/web/onvif_soap.c"
+$CC $WEB_CFLAGS -o "$WEB_BIN" $WEB_SRCS $WEB_LDFLAGS
+echo "编译成功: $WEB_BIN"
+echo "文件大小: $(ls -lh "$WEB_BIN" | awk '{print $5}')"
+echo ""
+echo "部署:"
+echo "  scp $WEB_BIN root@<IP>:/root/"
+echo "  scp -r src/web/static root@<IP>:/root/camera-web/"
+echo "板端运行:"
+echo "  ./rv1126_web"
+echo "  # 浏览器打开 http://<板子IP>:8080"
 echo "============================================"
