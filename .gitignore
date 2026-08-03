@@ -1,0 +1,10 @@
+# 编译产物
+output/
+output_native/
+
+# Claude Code 本地配置 (含板子登录凭据, 不提交)
+.claude/
+
+# 临时文件
+md-reader.html
+*.log
