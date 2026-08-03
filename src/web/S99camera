@@ -12,6 +12,9 @@ start)
     killall weston 2>/dev/null
     sleep 1
 
+    # weston 退出会关 MIPI 屏背光 (bl_power=4), 必须重新打开否则黑屏
+    echo 0 > /sys/class/backlight/backlight/bl_power 2>/dev/null
+
     # 启动 Web 管理后台 (它会自动恢复上次连接)
     if ! pidof rv1126_web >/dev/null 2>&1; then
         /root/rv1126_web >/tmp/web.log 2>&1 &
