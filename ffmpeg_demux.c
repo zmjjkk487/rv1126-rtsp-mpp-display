@@ -37,9 +37,12 @@ ffmpeg_demux_t *ffmpeg_demux_open(const config_t *c) {
     AVDictionary *opts = NULL;
     av_dict_set(&opts, "rtsp_transport", c->rtsp_transport ? "tcp" : "udp", 0);
 
-    char to_str[32];
-    snprintf(to_str, sizeof(to_str), "%d", RTSP_TIMEOUT_MS * 1000);
-    av_dict_set(&opts, "stimeout", to_str, 0);
+    /* 低延迟选项: 减小探测/缓冲, 启动快 + 实时性好 */
+    av_dict_set(&opts, "stimeout", "3000000", 0);         /* 3 秒超时 */
+    av_dict_set(&opts, "probesize", "32768", 0);           /* 32KB 探测 */
+    av_dict_set(&opts, "max_delay", "500000", 0);          /* 500ms 最大缓冲 */
+    av_dict_set(&opts, "analyzeduration", "1000000", 0);   /* 1 秒分析 */
+    av_dict_set(&opts, "fflags", "nobuffer", 0);           /* 不缓冲 */
 
     AVFormatContext *fmt = NULL;
     int ret = avformat_open_input(&fmt, c->rtsp_url, NULL, &opts);
@@ -110,6 +113,9 @@ int ffmpeg_demux_read(ffmpeg_demux_t *d, uint8_t **data) {
     while (1) {
         int ret = av_read_frame(fmt, pkt);
         if (ret < 0) {
+            char eb[256];
+            av_strerror(ret, eb, sizeof(eb));
+            LOGW("av_read_frame: %s", eb);
             av_packet_free(&pkt);
             return ret;
         }

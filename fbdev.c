@@ -42,7 +42,8 @@ int fb_init(fb_t *f, const char *device) {
         goto fail;
     }
 
-    f->size = f->w * f->h * 4;
+    /* back buffer 按显存行对齐分配，避免 line_length > w*4 时溢出 */
+    f->size = f->line_len * f->h;
     f->back = malloc(f->size);
     if (!f->back) {
         LOGE("malloc backbuf");
@@ -50,8 +51,12 @@ int fb_init(fb_t *f, const char *device) {
     }
     memset(f->back, 0, f->size);
 
-    /* 初始化 RGA 上下文（可选，失败不致命） */
-    f->rga_ok = (rga_init(&f->rga, 1920, 1080, (int)f->w, (int)f->h) == 0);
+    /* 初始化 RGA 上下文（可选，失败不致命）。
+     * 源分辨率暂设 1920×1080（占位），实际每帧 fb_show_nv12 中动态更新。
+     * src_stride / src_vstride 初始为占位值，后续会被 MPP 真实的
+     * hor_stride / ver_stride 覆盖（1080p 对齐后 vstride = 1088）。 */
+    f->rga_ok =
+        (rga_init(&f->rga, 1920, 1080, 1920, 1088, (int)f->w, (int)f->h) == 0);
     if (f->rga_ok)
         LOGI("RGA 硬件转换已启用 (NV12→RGB)");
     else
@@ -148,10 +153,25 @@ static void scale_nv12_nearest(const uint8_t *y, const uint8_t *uv, int sw,
 }
 
 void fb_show_nv12(fb_t *f, const uint8_t *y, const uint8_t *uv, int sw, int sh,
-                  int y_stride) {
+                  int y_stride, int y_vstride) {
     if (!f->mem || !f->back)
         return;
     int dw = (int)f->w, dh = (int)f->h;
+
+    /* 等比缩放: 保持视频宽高比, 补黑边填满屏幕 */
+    int vw = dw, vh = dh, xoff = 0, yoff = 0;
+    {
+        float sa = (float)sw / sh, da = (float)dw / dh;
+        if (sa > da) { /* 视频更宽 → 适配屏宽, 上下留黑 */
+            vw = dw;
+            vh = dw * sh / sw;
+            yoff = (dh - vh) / 2;
+        } else { /* 视频更高 → 适配屏高, 左右留黑 */
+            vh = dh;
+            vw = dh * sw / sh;
+            xoff = (dw - vw) / 2;
+        }
+    }
 
     /*
      * 策略: RGA 硬件优先 (零 CPU), 失败回退 CPU 软件转换。
@@ -162,16 +182,21 @@ void fb_show_nv12(fb_t *f, const uint8_t *y, const uint8_t *uv, int sw, int sh,
 
     /* 尝试 RGA 硬件转换 */
     if (f->rga_ok && y && uv) {
-        /* 更新 RGA 源尺寸(防止分辨率变化) */
-        if (sw != f->rga.src_w || sh != f->rga.src_h) {
+        /* 更新 RGA 尺寸(防止分辨率变化 + 等比缩放尺寸变化) */
+        if (sw != f->rga.src_w || sh != f->rga.src_h ||
+            y_stride != f->rga.src_stride || y_vstride != f->rga.src_vstride ||
+            vw != f->rga.dst_w || vh != f->rga.dst_h) {
             rga_deinit(&f->rga);
-            f->rga_ok = (rga_init(&f->rga, sw, sh, dw, dh) == 0);
+            f->rga_ok =
+                (rga_init(&f->rga, sw, sh, y_stride, y_vstride, vw, vh) == 0);
         }
 
         if (f->rga_ok) {
-            /* RGA 直接输出 RGB 到 back buffer */
-            uint8_t *rgb_buf = (uint8_t *)f->back;
-            if (rga_nv12_to_rgb(&f->rga, y, uv, rgb_buf) == 0)
+            memset(f->back, 0, f->size); /* 先清黑, RGA 只写视频区 */
+            /* RGA 输出到 back buffer 的等比缩放子区域 (偏移 xoff, yoff) */
+            uint8_t *dst = (uint8_t *)f->back + yoff * (int)f->w * 4 +
+                           xoff * 4;
+            if (rga_nv12_to_rgb(&f->rga, y, uv, dst) == 0)
                 goto write_fb; /* RGA 成功，跳过 CPU 转换 */
         }
     }

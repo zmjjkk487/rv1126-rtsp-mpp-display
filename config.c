@@ -17,6 +17,7 @@ static void trim(char *s) {
 void config_parse(const char *path, config_t *c) {
     memset(c, 0, sizeof(*c));
     snprintf(c->rtsp_url, sizeof(c->rtsp_url), "rtsp://192.168.50.10/test.264");
+    snprintf(c->fb_device, sizeof(c->fb_device), "/dev/fb0");
     c->rtsp_transport = 1;
     c->log_level = LOG_INFO;
 

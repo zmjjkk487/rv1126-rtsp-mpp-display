@@ -20,27 +20,29 @@
 
 /* RGA 转换句柄 */
 typedef struct {
-    int rga_fd;  /* /dev/rga 文件描述符, -1 表示未打开 */
-    int src_fmt; /* 源格式: RK_FORMAT_YCbCr_420_SP (NV12) */
-    int dst_fmt; /* 目标格式: RK_FORMAT_RGB_888 / RK_FORMAT_BGR_888 */
     int src_w, src_h;
-    int src_stride;
+    int src_stride;  /* 源帧 Y 平面行步长 (字节), 从 MPP hor_stride 获取 */
+    int src_vstride; /* 源帧垂直 stride (行), 从 MPP ver_stride 获取 */
     int dst_w, dst_h;
     int dst_stride; /* 目标行步长 (字节) */
 } rga_ctx_t;
 
-/*
- * 初始化 RGA 转换上下文
- * src_w/src_h: 源 NV12 帧尺寸 (解码后尺寸)
- * dst_w/dst_h: 目标 RGB 帧尺寸 (屏幕尺寸)
- * 返回: 0=成功, -1=失败(可回退 CPU 转换)
+/**
+ * rga_init — 初始化 RGA 转换上下文
+ * @sw, sh       源帧宽高
+ * @src_stride   源帧 Y 平面行步长 (通常 = MPP 输出的 hor_stride，可能 ≠ sw)
+ * @src_vstride  源帧垂直 stride (通常 = MPP 输出的 ver_stride, 16 对齐后
+ *              可能 > sh)。RGA 按 wstride*hstride 定位 NV12 的 UV 平面,
+ *              填错会导致 UV 偏移→色偏, 必须传 MPP 的真实 ver_stride
+ * @dw, dh       目标宽高
  */
-int rga_init(rga_ctx_t *ctx, int src_w, int src_h, int dst_w, int dst_h);
+int rga_init(rga_ctx_t *ctx, int sw, int sh, int src_stride, int src_vstride,
+             int dw, int dh);
 
 /*
- * 执行 NV12 → RGB 转换 + 缩放
+ * 执行 NV12 → BGRX_8888 转换 + 缩放
  * y/uv:   MPP 解码输出的 NV12 帧 (Y 和 UV 平面)
- * rgb:    目标 RGB 缓冲区, 调用方分配 (dst_w * dst_h * 3 字节)
+ * rgb:    目标 BGRX_8888 缓冲区, 调用方分配 (dst_w * dst_h * 4 字节)
  * 返回: 0=成功, -1=失败
  */
 int rga_nv12_to_rgb(rga_ctx_t *ctx, const uint8_t *y, const uint8_t *uv,

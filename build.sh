@@ -1,6 +1,6 @@
 #!/bin/bash
-# RV1126 GStreamer RTSP 解码显示 — 交叉编译脚本
-# 管道: rtspsrc → rtph264depay → h264parse → mppvideodec → videoconvert → fbdevsink
+# RV1126 GStreamer + RGA 混合管线 — 交叉编译
+# 管道: rtspsrc → depay → parse → mppvideodec → appsink(NV12) → RGA → fbdev
 
 set -e
 
@@ -8,7 +8,6 @@ PROJECT="rv1126_gst_display"
 OUTDIR="output"
 BIN="$OUTDIR/$PROJECT"
 
-# ---- 工具链 ----
 TC="/opt/atk-dlrv1126b-toolchain"
 CC="${TC}/bin/aarch64-buildroot-linux-gnu-gcc"
 SYSROOT="${TC}/aarch64-buildroot-linux-gnu/sysroot"
@@ -29,9 +28,10 @@ CFLAGS="$CFLAGS -I$SYSROOT/usr/lib/glib-2.0/include"
 CFLAGS="$CFLAGS -I$SYSROOT/usr/include"
 
 LDFLAGS="--sysroot=$SYSROOT -L$SYSROOT/usr/lib"
-LDFLAGS="$LDFLAGS -lgstreamer-1.0 -lgobject-2.0 -lglib-2.0 -lgmodule-2.0 -lm -ldl"
+LDFLAGS="$LDFLAGS -lgstreamer-1.0 -lgobject-2.0 -lglib-2.0 -lgmodule-2.0"
+LDFLAGS="$LDFLAGS -lgstapp-1.0 -lgstvideo-1.0 -lm -ldl"
 
-SRCS="main.c log.c config.c"
+SRCS="main.c log.c config.c fbdev.c rga_convert.c"
 
 mkdir -p "$OUTDIR"
 
@@ -48,5 +48,5 @@ echo "  scp $BIN config.ini root@<IP>:/root/"
 echo "板端运行:"
 echo "  ./$PROJECT config.ini"
 echo ""
-echo "管道: rtspsrc → h264depay → parse → mppvideodec → videoconvert → fbdevsink"
+echo "管道: rtspsrc → depay → parse → mppvideodec → appsink → RGA → fbdev"
 echo "============================================"

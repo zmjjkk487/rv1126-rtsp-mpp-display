@@ -30,7 +30,7 @@
 
 static volatile int running = 0;
 static int frame_cnt = 0;
-static time_t t_start;
+static time_t t_start = 0;
 
 static void on_signal(int s) {
     (void)s;
@@ -102,7 +102,7 @@ int main(int argc, char *argv[]) {
         if (!mpp_ok) {
             LOGI("[2/3] 初始化 MPP 硬解码器 (%dx%d)...", demux->width,
                  demux->height);
-            if (mpp_dec_init(&dec, demux->width, demux->height) < 0) {
+            if (mpphw_dec_init(&dec, demux->width, demux->height) < 0) {
                 LOGW("MPP 初始化失败");
                 ffmpeg_demux_close(demux);
                 sleep(backoff);
@@ -126,18 +126,18 @@ int main(int argc, char *argv[]) {
             }
 
             uint8_t *y = NULL, *uv = NULL;
-            int fw = 0, fh = 0, fs = 0;
+            int fw = 0, fh = 0, fs = 0, fvs = 0;
 
-            int ret = mpp_dec_decode(&dec, frame_data, frame_size, &y, &uv, &fw,
-                                     &fh, &fs);
+            int ret = mpphw_dec_decode(&dec, frame_data, frame_size, &y, &uv,
+                                       &fw, &fh, &fs, &fvs);
             if (ret < 0)
                 continue;
             if (ret > 0) {
                 if (y && uv && fw > 0 && fh > 0) {
-                    fb_show_nv12(&fb, y, uv, fw, fh, fs);
+                    fb_show_nv12(&fb, y, uv, fw, fh, fs, fvs);
                     frame_cnt++;
                 }
-                mpp_dec_return(&dec); /* 无论是否显示，必须释放帧 */
+                mpphw_dec_return(&dec); /* 无论是否显示，必须释放帧 */
             }
 
             /* 帧率控制（放在 decode 之后，避免阻塞解码） */
@@ -171,7 +171,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (mpp_ok)
-        mpp_dec_deinit(&dec);
+        mpphw_dec_deinit(&dec);
     fb_deinit(&fb);
 exit: {
     double el = difftime(time(NULL), t_start);
