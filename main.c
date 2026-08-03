@@ -230,7 +230,20 @@ static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer data) {
     const uint8_t *y = map.data + y_off;
     const uint8_t *uv = map.data + uv_off;
 
-    fb_show_nv12(&g_fb, y, uv, w, h, hs, vs);
+    /* 像素宽高比 (SAR): 优先用流元数据, 无元数据时 PAL 分辨率按 4:3 惯例
+     * (704×576 像素比 1.222, 但 PAL 标准显示为 4:3 = PAR 12:11)
+     * 注意: GStreamer 无 SAR 时 par 默认 1:1, 不能只判 >0 */
+    int par_n = 1, par_d = 1;
+    int has_sar = (vinfo.par_n != 1 || vinfo.par_d != 1);
+    if (has_sar) {
+        par_n = vinfo.par_n;
+        par_d = vinfo.par_d;
+    } else if (w == 704 && h == 576) {
+        par_n = 12;
+        par_d = 11;
+    }
+
+    fb_show_nv12(&g_fb, y, uv, w, h, hs, vs, par_n, par_d);
 
     gst_buffer_unmap(buf, &map);
     gst_sample_unref(sample);

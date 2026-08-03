@@ -153,23 +153,30 @@ static void scale_nv12_nearest(const uint8_t *y, const uint8_t *uv, int sw,
 }
 
 void fb_show_nv12(fb_t *f, const uint8_t *y, const uint8_t *uv, int sw, int sh,
-                  int y_stride, int y_vstride) {
+                  int y_stride, int y_vstride, int par_n, int par_d) {
     if (!f->mem || !f->back)
         return;
     f->frame_nr++;
     int dw = (int)f->w, dh = (int)f->h;
 
-    /* 等比缩放: 保持视频宽高比, 补黑边填满屏幕 */
+    /* 等比缩放: 保持视频宽高比, 补黑边填满屏幕
+     * 有效宽高比 = (sw × par_n/par_d) : sh  (SAR 校正)
+     * PAL 704×576 按 4:3 (12:11) 显示, 否则画面上下拉伸
+     * 注意: 浮点四舍五入 + 偶数对齐 (RGA2 对奇数目标尺寸会内部对齐) */
+    if (par_n <= 0) par_n = 1;
+    if (par_d <= 0) par_d = 1;
     int vw = dw, vh = dh, xoff = 0, yoff = 0;
     {
-        float sa = (float)sw / sh, da = (float)dw / dh;
+        float sa = (float)sw * par_n / par_d / sh, da = (float)dw / dh;
         if (sa > da) { /* 视频更宽 → 适配屏宽, 上下留黑 */
             vw = dw;
-            vh = dw * sh / sw;
+            vh = (int)((float)dw * sh * par_d / par_n / sw + 0.5f);
+            if (vh & 1) vh++;
             yoff = (dh - vh) / 2;
         } else { /* 视频更高 → 适配屏高, 左右留黑 */
             vh = dh;
-            vw = dh * sw / sh;
+            vw = (int)((float)dh * sw * par_n / par_d / sh + 0.5f);
+            if (vw & 1) vw++;
             xoff = (dw - vw) / 2;
         }
     }

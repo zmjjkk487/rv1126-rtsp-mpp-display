@@ -131,7 +131,17 @@ function startPreview(rtspUrl) {
         });
         hlsPlayer.loadSource(hlsUrl);
         hlsPlayer.attachMedia(video);
-        hlsPlayer.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(()=>{}));
+        hlsPlayer.on(Hls.Events.MANIFEST_PARSED, () => {
+          // 704×576 (PAL) 像素比 1.222, 行业惯例按 4:3 显示 → 强制 aspect-ratio
+          video.addEventListener('loadedmetadata', () => {
+            if (video.videoWidth === 704 && video.videoHeight === 576) {
+              video.style.aspectRatio = '4 / 3';
+            } else {
+              video.style.aspectRatio = '';
+            }
+          });
+          video.play().catch(()=>{});
+        });
         // fatal 错误自动重试一次, 不再直接弹窗
         let retried = false;
         hlsPlayer.on(Hls.Events.ERROR, (e, data) => {
