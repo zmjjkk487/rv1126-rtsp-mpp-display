@@ -705,6 +705,12 @@ async fn handle_hls_start(
 async fn handle_hls_stop() -> Response {
     let _ = Command::new("killall").args(["-9", "gst-launch-1.0"]).output().await;
     let _ = std::fs::remove_file("/tmp/hls_token");
+    // 停止预览后清理分片缓存 (避免残留最多 30 个 ts 文件)
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg("rm -f /root/hls/*.ts /root/hls/*.m3u8")
+        .output()
+        .await;
     Json(serde_json::json!({"status":"ok"})).into_response()
 }
 
