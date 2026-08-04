@@ -29,13 +29,109 @@
 
 #include "onvif_disco.h"
 #include "onvif_soap.h"
+#include <openssl/sha.h>
+#include <openssl/rand.h>
 
 #define PORT         8080
 #define MAX_CLIENTS  8
 #define BUF_SIZE     16384
 #define STATIC_DIR   "/root/camera-web/static"
+#define PASSWD_FILE  "/root/camera-web/passwd"
+#define SESSION_FILE "/tmp/web_token"
+#define DEFAULT_HASH "240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9"
+static char g_passwd_hash[65] = "";
 
-/* === 工具: URL 解码 === */
+/* 前向声明 — handle_login 在其定义前被 handle_request 调用 */
+static void http_ok(int fd, const char *ct, const char *body);
+static void http_err(int fd, int code, const char *msg);
+
+/* === 工具: SHA256 哈希 → 64 字符 hex === */
+static void sha256_hex(const char *input, char out[65]) {
+    unsigned char hash[32];
+    SHA256((const unsigned char *)input, strlen(input), hash);
+    for (int i = 0; i < 32; i++)
+        sprintf(out + i * 2, "%02x", hash[i]);
+    out[64] = '\0';
+}
+
+/* === 工具: 生成 32 字符随机 session token === */
+static void gen_token(char out[33]) {
+    unsigned char buf[16];
+    RAND_bytes(buf, sizeof(buf));
+    for (int i = 0; i < 16; i++)
+        sprintf(out + i * 2, "%02x", buf[i]);
+    out[32] = '\0';
+}
+
+/* === 工具: 检查 HTTP Authorization Bearer token === */
+static int check_auth(const char *req) {
+    const char *auth = strstr(req, "Authorization: Bearer ");
+    if (!auth) return 0;
+    auth += 22;
+    char token[64];
+    int i;
+    for (i = 0; i < 63 && auth[i] && auth[i] != '\r' && auth[i] != '\n'; i++)
+        token[i] = auth[i];
+    token[i] = '\0';
+    if (!token[0]) return 0;
+    FILE *fp = fopen(SESSION_FILE, "r");
+    if (!fp) return 0;
+    char stored[64] = "";
+    fgets(stored, sizeof(stored), fp);
+    fclose(fp);
+    size_t sl = strlen(stored);
+    while (sl > 0 && (stored[sl-1] == '\n' || stored[sl-1] == '\r')) stored[--sl] = '\0';
+    return strcmp(token, stored) == 0;
+}
+
+/* === HTTP 401 未授权响应 === */
+static void http_401(int fd) {
+    const char *body = "{\"error\":\"unauthorized\"}";
+    char hdr[256];
+    snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 401 Unauthorized\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "\r\n", strlen(body));
+    send(fd, hdr, strlen(hdr), MSG_NOSIGNAL);
+    send(fd, body, strlen(body), MSG_NOSIGNAL);
+}
+
+/* === API: POST /api/login — 验证账号密码, 返回 session token === */
+static void handle_login(int fd, const char *body) {
+    char user[64] = "", pass[64] = "";
+    const char *u = strstr(body, "\"user\":\"");
+    const char *p = strstr(body, "\"pass\":\"");
+    if (u) { u += 8; const char *ue = strchr(u, '"'); if (ue) { size_t l = ue - u; if (l < 64) { memcpy(user, u, l); user[l] = 0; } } }
+    if (p) { p += 8; const char *pe = strchr(p, '"'); if (pe) { size_t l = pe - p; if (l < 64) { memcpy(pass, p, l); pass[l] = 0; } } }
+    if (!user[0] || !pass[0]) { http_err(fd, 400, "{\"error\":\"missing user/pass\"}"); return; }
+
+    char hash[65];
+    sha256_hex(pass, hash);
+    if (strcmp(hash, g_passwd_hash) != 0) {
+        http_err(fd, 403, "{\"error\":\"wrong user or password\"}");
+        return;
+    }
+
+    char token[33];
+    gen_token(token);
+    FILE *fp = fopen(SESSION_FILE, "w");
+    if (!fp) { http_err(fd, 500, "{\"error\":\"session error\"}"); return; }
+    fprintf(fp, "%s\n", token);
+    fclose(fp);
+
+    char resp[256];
+    snprintf(resp, sizeof(resp), "{\"status\":\"ok\",\"token\":\"%s\"}", token);
+    http_ok(fd, "application/json", resp);
+}
+
+/* === API: POST /api/logout — 注销 session === */
+static void handle_logout(int fd) {
+    remove(SESSION_FILE);
+    http_ok(fd, "application/json", "{\"status\":\"ok\"}");
+}
 static void url_decode(char *dst, const char *src, size_t sz) {
     char a, b;
     while (*src && --sz > 0) {
@@ -338,6 +434,7 @@ static void handle_request(int fd) {
 
     /* GET /api/scan */
     if (strcmp(method, "GET") == 0 && strcmp(decoded, "/api/scan") == 0) {
+        if (!check_auth(buf)) { http_401(fd); close(fd); return; }
         handle_scan(fd);
         close(fd);
         return;
@@ -345,6 +442,7 @@ static void handle_request(int fd) {
 
     /* GET /api/status */
     if (strcmp(method, "GET") == 0 && strcmp(decoded, "/api/status") == 0) {
+        if (!check_auth(buf)) { http_401(fd); close(fd); return; }
         FILE *pp = popen("pgrep -f rtsp_display", "r");
         char pid[32] = {0};
         if (pp) { fgets(pid, sizeof(pid), pp); pclose(pp); }
@@ -362,6 +460,7 @@ static void handle_request(int fd) {
 
     /* POST /api/connect */
     if (strcmp(method, "POST") == 0 && strcmp(decoded, "/api/connect") == 0) {
+        if (!check_auth(buf)) { http_401(fd); close(fd); return; }
         const char *body = strstr(buf, "\r\n\r\n");
         if (body) body += 4;
         else body = "";
@@ -448,6 +547,7 @@ static void handle_request(int fd) {
     /* POST /api/hls_start — 启动 ffmpeg RTSP→HLS 转码
      * body: {"url":"rtsp://..."} */
     if (strcmp(method, "POST") == 0 && strcmp(decoded, "/api/hls_start") == 0) {
+        if (!check_auth(buf)) { http_401(fd); close(fd); return; }
         const char *body = strstr(buf, "\r\n\r\n");
         if (body) body += 4;
         else body = "";
@@ -486,8 +586,26 @@ static void handle_request(int fd) {
 
     /* POST /api/hls_stop — 停止 HLS 转码 */
     if (strcmp(method, "POST") == 0 && strcmp(decoded, "/api/hls_stop") == 0) {
+        if (!check_auth(buf)) { http_401(fd); close(fd); return; }
         system("killall -9 gst-launch-1.0 2>/dev/null");
         http_ok(fd, "application/json", "{\"status\":\"ok\"}");
+        close(fd);
+        return;
+    }
+
+    /* POST /api/login — 登录 (不需要认证) */
+    if (strcmp(method, "POST") == 0 && strcmp(decoded, "/api/login") == 0) {
+        const char *body = strstr(buf, "\r\n\r\n");
+        if (body) body += 4; else body = "";
+        handle_login(fd, body);
+        close(fd);
+        return;
+    }
+
+    /* POST /api/logout — 注销 (需要认证) */
+    if (strcmp(method, "POST") == 0 && strcmp(decoded, "/api/logout") == 0) {
+        if (!check_auth(buf)) { http_401(fd); close(fd); return; }
+        handle_logout(fd);
         close(fd);
         return;
     }
@@ -502,6 +620,35 @@ int main(void) {
     signal(SIGPIPE, SIG_IGN);
     /* fork 的子进程退出后自动回收, 防止僵尸堆积 */
     signal(SIGCHLD, SIG_IGN);
+
+    /* 初始化密码文件 (默认账号 admin, 默认密码 admin123) */
+    FILE *pf = fopen(PASSWD_FILE, "r");
+    if (!pf) {
+        pf = fopen(PASSWD_FILE, "w");
+        if (pf) {
+            fprintf(pf, "admin:%s\n", DEFAULT_HASH);
+            fclose(pf);
+        }
+        strncpy(g_passwd_hash, DEFAULT_HASH, 64);
+        g_passwd_hash[64] = '\0';
+    } else {
+        char line[256];
+        if (fgets(line, sizeof(line), pf)) {
+            char *colon = strchr(line, ':');
+            if (colon) {
+                char *h = colon + 1;
+                size_t hl = strlen(h);
+                while (hl > 0 && (h[hl-1] == '\n' || h[hl-1] == '\r')) h[--hl] = '\0';
+                strncpy(g_passwd_hash, h, 64);
+                g_passwd_hash[64] = '\0';
+            }
+        }
+        fclose(pf);
+    }
+    if (!g_passwd_hash[0]) {
+        memcpy(g_passwd_hash, DEFAULT_HASH, 64);
+        g_passwd_hash[64] = '\0';
+    }
 
     int server = socket(AF_INET, SOCK_STREAM, 0);
     if (server < 0) { perror("socket"); return 1; }

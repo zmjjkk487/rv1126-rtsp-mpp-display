@@ -1,0 +1,9 @@
+[network]
+# 摄像头 RTSP 地址 (请替换为你的摄像头地址)
+rtsp_url = rtsp://admin:password@192.168.1.100:554/stream0
+# 传输协议: tcp (可靠) 或 udp (低延迟)
+rtsp_transport = tcp
+
+[log]
+# 日志级别: debug, info, warn, error
+log_level = info
