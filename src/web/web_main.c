@@ -209,7 +209,6 @@ static void json_escape(char *dst, const char *src, size_t sz) {
     while (*src && pos < sz - 8) {  /* 留足最坏 case: &#39; = 5 chars */
         if (*src == '"')  { dst[pos++] = '\\'; dst[pos++] = '"'; }
         else if (*src == '\\') { dst[pos++] = '\\'; dst[pos++] = '\\'; }
-        else if (*src == '&')  { memcpy(dst+pos, "&amp;", 5); pos += 5; }
         else if (*src == '<')  { memcpy(dst+pos, "&lt;", 4);  pos += 4; }
         else if (*src == '>')  { memcpy(dst+pos, "&gt;", 4);  pos += 4; }
         else if (*src == '\'') { memcpy(dst+pos, "&#39;", 5); pos += 5; }
@@ -381,7 +380,7 @@ static void handle_scan(int fd) {
     free(json);
 }
 
-/* === API: POST /api/connect — 写入 config.ini + 重启管线 === */
+/* === API: POST /api/connect — 保存凭据 + 写入 config.ini + 重启管线 === */
 static void handle_connect(int fd, const char *body) {
     /* 从 POST body 解析 url */
     const char *url = strstr(body, "\"url\":\"");
@@ -403,23 +402,42 @@ static void handle_connect(int fd, const char *body) {
     if (u) { u += 8; const char *ue = strchr(u, '"'); if (ue) { size_t ul = ue - u; if (ul < 64) { memcpy(user, u, ul); user[ul] = 0; } } }
     if (p) { p += 8; const char *pe = strchr(p, '"'); if (pe) { size_t pl = pe - p; if (pl < 64) { memcpy(pass, p, pl); pass[pl] = 0; } } }
 
-    /* 把 user/pass 注入 RTSP URL (rtsp://user:pass@host/path)
-     * 否则摄像头返回 401 Unauthorized, 管线起不来 */
-    char final_url[512];
-    if (user[0] && strstr(rtsp, "://") && !strstr(rtsp, "@")) {
-        const char *proto_end = strstr(rtsp, "://") + 3;
-        snprintf(final_url, sizeof(final_url), "%.*s%s:%s@%s",
-                 (int)(proto_end - rtsp), rtsp, user, pass, proto_end);
-    } else {
-        snprintf(final_url, sizeof(final_url), "%s", rtsp);
+    /* 如果 URL 自带 user:pass@, 也提取出来 */
+    const char *at = strstr(rtsp, "@");
+    if (at) {
+        const char *proto = strstr(rtsp, "://");
+        if (proto) {
+            const char *creds_start = proto + 3;
+            const char *colon_in_url = strchr(creds_start, ':');
+            if (colon_in_url && colon_in_url < at) {
+                size_t ul = colon_in_url - creds_start;
+                if (ul < 64) { memcpy(user, creds_start, ul); user[ul] = 0; }
+                size_t pl = at - colon_in_url - 1;
+                if (pl < 64) { memcpy(pass, colon_in_url + 1, pl); pass[pl] = 0; }
+            }
+        }
     }
 
-    /* 写入 config.ini */
+    /* 保存凭据到独立文件 (不在 config.ini/last_connect.json 暴露明文密码) */
+    FILE *cf = fopen("/root/camera-web/creds", "w");
+    if (cf) { fprintf(cf, "%s:%s\n", user, pass); fclose(cf); chmod("/root/camera-web/creds", 0600); }
+
+    /* 从 URL 中去掉 user:pass@, 只保留 rtsp://host:port/path */
+    char base_url[512];
+    if (at) {
+        const char *proto = strstr(rtsp, "://") + 3;
+        snprintf(base_url, sizeof(base_url), "%.*s%s",
+                 (int)(proto - rtsp), rtsp, at + 1);
+    } else {
+        snprintf(base_url, sizeof(base_url), "%s", rtsp);
+    }
+
+    /* 写入 config.ini (不含密码) */
     FILE *fp = fopen("/root/config.ini", "w");
     if (!fp) { http_err(fd, 500, "{\"error\":\"cannot write config\"}"); return; }
     fprintf(fp, "[network]\n");
-    fprintf(fp, "# 摄像头 RTSP 地址 (由 Web 管理后台自动配置)\n");
-    fprintf(fp, "rtsp_url = %s\n", final_url);
+    fprintf(fp, "# 摄像头 RTSP 地址 (凭据单独存在 %s)\n", "/root/camera-web/creds");
+    fprintf(fp, "rtsp_url = %s\n", base_url);
     fprintf(fp, "rtsp_transport = tcp\n\n");
     fprintf(fp, "[log]\n");
     fprintf(fp, "log_level = info\n");
@@ -435,10 +453,10 @@ static void handle_connect(int fd, const char *body) {
     system("cd /root && nohup /root/rtsp_display /root/config.ini "
            "</dev/null >/tmp/gst_web.log 2>&1 &");
 
-    /* 记忆上次连接: 开机自启脚本读它自动连回 */
+    /* 记忆上次连接: 开机自启脚本读它自动连回 (不含密码) */
     FILE *lf = fopen("/root/last_connect.json", "w");
     if (lf) {
-        fprintf(lf, "{\"url\":\"%s\"}\n", final_url);
+        fprintf(lf, "{\"url\":\"%s\"}\n", base_url);
         fclose(lf);
     }
 
@@ -454,7 +472,7 @@ static void handle_connect(int fd, const char *body) {
     char resp[512];
     snprintf(resp, sizeof(resp),
              "{\"status\":\"ok\",\"pid\":\"%s\",\"rtsp\":\"%s\"}",
-             pidbuf[0] ? pidbuf : "0", final_url);
+             pidbuf[0] ? pidbuf : "0", base_url);
     http_ok(fd, "application/json", resp);
 }
 
@@ -563,7 +581,8 @@ static void handle_request(int fd) {
     }
 
     /* GET /hls/stream.m3u8 — 动态生成 live playlist (需要 HLS token) */
-    if (strcmp(method, "GET") == 0 && strcmp(decoded, "/hls/stream.m3u8") == 0) {
+    if (strcmp(method, "GET") == 0 && strncmp(decoded, "/hls/stream.m3u8", 16) == 0
+        && (decoded[16] == '\0' || decoded[16] == '?')) {
         if (!check_token_param(path)) { http_401(fd); close(fd); return; }
         /* 提取 token 用于注入到分片 URL */
         const char *tok = strstr(path, "?t=") ? strstr(path, "?t=") + 3 : "";

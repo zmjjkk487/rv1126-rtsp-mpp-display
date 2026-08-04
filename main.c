@@ -326,6 +326,33 @@ int main(int argc, char *argv[]) {
     }
 
     config_parse(cfg_path, &g_cfg);
+
+    /* 从凭据文件注入 user:pass@ 到 RTSP URL (不在 config.ini 暴露明文密码) */
+    if (!strstr(g_cfg.rtsp_url, "@")) {
+        FILE *cf = fopen("/root/camera-web/creds", "r");
+        if (cf) {
+            char line[128];
+            if (fgets(line, sizeof(line), cf)) {
+                size_t l = strlen(line);
+                while (l > 0 && (line[l-1] == '\n' || line[l-1] == '\r')) line[--l] = '\0';
+                char *colon = strchr(line, ':');
+                if (colon) {
+                    *colon = '\0';
+                    const char *proto = strstr(g_cfg.rtsp_url, "://");
+                    if (proto) {
+                        proto += 3;
+                        char tmp[MAX_PATH];
+                        snprintf(tmp, sizeof(tmp), "%.*s%s:%s@%s",
+                                 (int)(proto - g_cfg.rtsp_url), g_cfg.rtsp_url,
+                                 line, colon + 1, proto);
+                        strncpy(g_cfg.rtsp_url, tmp, MAX_PATH - 1);
+                        g_cfg.rtsp_url[MAX_PATH - 1] = '\0';
+                    }
+                }
+            }
+            fclose(cf);
+        }
+    }
     log_set_level(g_cfg.log_level);
 
     FILE *lf = fopen("/var/log/rv1126_gst.log", "a");

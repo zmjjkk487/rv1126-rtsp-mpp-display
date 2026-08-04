@@ -9,8 +9,6 @@
 
 typedef struct {
     char rtsp_url[MAX_PATH];
-    char rtsp_user[64];
-    char rtsp_pass[64];
     int  rtsp_transport;       /* 1=tcp, 0=udp */
     char fb_device[MAX_PATH];  /* /dev/fb0 */
     log_level_t log_level;

@@ -41,13 +41,7 @@ void config_parse(const char *path, config_t *c) {
         trim(val);
         if (!strcmp(key, "rtsp_url"))
             snprintf(c->rtsp_url, sizeof(c->rtsp_url), "%s", val);
-        else if (!strcmp(key, "rtsp_user")) {
-            strncpy(c->rtsp_user, val, sizeof(c->rtsp_user) - 1);
-            c->rtsp_user[sizeof(c->rtsp_user) - 1] = '\0';
-        } else if (!strcmp(key, "rtsp_pass")) {
-            strncpy(c->rtsp_pass, val, sizeof(c->rtsp_pass) - 1);
-            c->rtsp_pass[sizeof(c->rtsp_pass) - 1] = '\0';
-        } else if (!strcmp(key, "rtsp_transport"))
+        else if (!strcmp(key, "rtsp_transport"))
             c->rtsp_transport = strcmp(val, "udp") ? 1 : 0;
         else if (!strcmp(key, "fb_device"))
             snprintf(c->fb_device, sizeof(c->fb_device), "%s", val);
