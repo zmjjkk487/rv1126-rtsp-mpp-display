@@ -19,9 +19,16 @@ start)
 
     # 释放 /dev/fb0
     killall weston 2>/dev/null
-    sleep 1
 
-    # weston 退出会关 MIPI 屏背光 (bl_power=4), 必须重新打开否则黑屏
+    # 等 weston 完全退出 (最多 5 秒)
+    # 关键: weston 退出时会写 bl_power=4 关背光,
+    # 如果先写 0 再等, weston 退出后会把 0 覆盖成 4 → 黑屏
+    for i in 1 2 3 4 5; do
+        pidof weston >/dev/null 2>&1 || break
+        sleep 1
+    done
+
+    # weston 已退出, 现在开背光不会被覆盖
     echo 0 > /sys/class/backlight/backlight/bl_power 2>/dev/null
 
     # 启动 Web 管理后台 (Rust 版; 它会自动恢复上次连接)

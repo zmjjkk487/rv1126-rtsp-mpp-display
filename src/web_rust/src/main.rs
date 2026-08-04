@@ -288,6 +288,29 @@ fn make_soap_request(user: &str, pass: &str, body: &str) -> String {
 /// 发送 ONVIF SOAP 请求, 返回响应文本
 /// 认证策略: 先 WS-Security (WSS), 失败/401 回退 HTTP Basic Auth
 /// (海康等品牌对 WSS 支持不稳定, Basic Auth 更可靠)
+/// 构造无认证的裸 SOAP 请求 (带 trt/tds/t 命名空间)
+fn make_plain_soap(body_xml: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+            xmlns:trt="http://www.onvif.org/ver10/media/wsdl"
+            xmlns:tds="http://www.onvif.org/ver10/device/wsdl"
+            xmlns:t="http://www.onvif.org/ver10/schema">
+<s:Body>{}</s:Body>
+</s:Envelope>"#,
+        body_xml
+    )
+}
+
+/// 判断 SOAP 响应是否含 Fault (认证失败/不支持)
+fn has_fault(text: &str) -> bool {
+    text.contains("<SOAP-ENV:Fault>") || text.contains("Fault")
+}
+
+/// ONVIF SOAP 请求, 三级认证回退:
+/// 1. WS-Security (海康等)
+/// 2. Basic Auth (部分老设备)
+/// 3. 无认证裸 SOAP (新设备/测试相机, 不支持 WSS, 但允许匿名访问)
 async fn soap_post(xaddr: &str, body_xml: &str, user: &str, pass: &str) -> Result<String, ()> {
     let client = reqwest::Client::new();
 
@@ -303,31 +326,38 @@ async fn soap_post(xaddr: &str, body_xml: &str, user: &str, pass: &str) -> Resul
         .map_err(|_| ())?;
     let text = resp.text().await.map_err(|_| ())?;
 
-    // 2. WSS 失败 (Fault/401) → 回退 Basic Auth
-    if text.contains("<SOAP-ENV:Fault>") || text.contains("Fault") {
-        let soap2 = format!(
-            r#"<?xml version="1.0" encoding="utf-8"?>
-<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
-            xmlns:trt="http://www.onvif.org/ver10/media/wsdl"
-            xmlns:tds="http://www.onvif.org/ver10/device/wsdl">
-<s:Body>{}</s:Body>
-</s:Envelope>"#,
-            body_xml
-        );
-        let resp2 = client
-            .post(xaddr)
-            .basic_auth(user, Some(pass))
-            .header("Content-Type", "application/soap+xml; charset=utf-8")
-            .body(soap2)
-            .timeout(Duration::from_secs(5))
-            .send()
-            .await
-            .map_err(|_| ())?;
-        let text2 = resp2.text().await.map_err(|_| ())?;
+    if !has_fault(&text) {
+        return Ok(text);
+    }
+
+    // 2. WSS 失败 → Basic Auth
+    let soap2 = make_plain_soap(body_xml);
+    let resp2 = client
+        .post(xaddr)
+        .basic_auth(user, Some(pass))
+        .header("Content-Type", "application/soap+xml; charset=utf-8")
+        .body(soap2.clone())
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|_| ())?;
+    let text2 = resp2.text().await.map_err(|_| ())?;
+
+    if !has_fault(&text2) {
         return Ok(text2);
     }
 
-    Ok(text)
+    // 3. Basic 也失败 → 无认证裸 SOAP (不带 Authorization 头)
+    let resp3 = client
+        .post(xaddr)
+        .header("Content-Type", "application/soap+xml; charset=utf-8")
+        .body(soap2)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|_| ())?;
+    let text3 = resp3.text().await.map_err(|_| ())?;
+    Ok(text3)
 }
 
 async fn onvif_get_profiles(xaddr: &str, user: &str, pass: &str) -> Vec<ProfileInfo> {
@@ -390,6 +420,77 @@ fn extract_xml_val<T>(xml: &str, tag: &str, f: impl Fn(&str) -> Option<T>) -> Op
     let start = xml.find(&open)? + open.len();
     let end = xml[start..].find(&close)?;
     f(xml[start..start + end].trim())
+}
+
+// ─── IRCUT 红外控制 (标准 ONVIF Imaging) ─────────────────────
+
+/// 获取摄像头 IP (从 config.ini 解析)
+fn camera_ip() -> String {
+    if let Ok(cfg) = std::fs::read_to_string("/root/config.ini") {
+        for line in cfg.lines() {
+            if let Some(url) = line.trim().strip_prefix("rtsp_url = ") {
+                // rtsp://192.168.x.x/... 提取 IP
+                if let Some(rest) = url.strip_prefix("rtsp://") {
+                    let host = rest.split(['/', ':', '@']).next().unwrap_or("");
+                    if !host.is_empty() {
+                        return host.to_string();
+                    }
+                }
+            }
+        }
+    }
+    "192.168.50.168".to_string()
+}
+
+/// 获取 VideoSourceToken (从 GetProfiles 响应解析, 不同摄像头 token 不同)
+/// 海康: VideoSourceMain | 标准相机: video_source1 / video_source_config1 等
+/// 解析策略: 找 VideoSourceConfiguration 里的 SourceToken (视频源 token, 用于 Imaging)
+async fn get_video_source_token(ip: &str, user: &str, pass: &str) -> String {
+    let body = "<trt:GetProfiles/>";
+    if let Ok(xml) = soap_post(&format!("http://{}/onvif/device_service", ip), body, user, pass).await {
+        // 逐个尝试 SourceToken (不同前缀: tt: 或 t: 或无前缀)
+        for tag in ["tt:SourceToken", "t:SourceToken", "SourceToken"] {
+            if let Some(src) = extract_xml_val(&xml, tag, |v| Some(v.to_string())) {
+                if !src.is_empty() {
+                    return src;
+                }
+            }
+        }
+    }
+    // 回退: 常见 token 名
+    "VideoSourceMain".to_string()
+}
+
+/// 读取当前 IRCUT 状态 (ONVIF GetImagingSettings → IrCutFilter)
+async fn onvif_get_ircut(ip: &str, user: &str, pass: &str) -> Option<String> {
+    let token = get_video_source_token(ip, user, pass).await;
+    let body = format!(
+        "<trt:GetImagingSettings><trt:VideoSourceToken>{}</trt:VideoSourceToken></trt:GetImagingSettings>",
+        token
+    );
+    let xml = soap_post(&format!("http://{}/onvif/device_service", ip), &body, user, pass).await.ok()?;
+    // 提取 <tt:IrCutFilter>ON/OFF/AUTO</tt:IrCutFilter>
+    extract_xml_val(&xml, "tt:IrCutFilter", |v| Some(v.to_string()))
+}
+
+/// 设置 IRCUT (ONVIF SetImagingSettings)
+/// mode: "ON"=红外 / "OFF"=彩色 / "AUTO"=自动
+async fn onvif_set_ircut(ip: &str, user: &str, pass: &str, mode: &str) -> bool {
+    let token = get_video_source_token(ip, user, pass).await;
+    let body = format!(
+        r#"<trt:SetImagingSettings>
+<trt:VideoSourceToken>{}</trt:VideoSourceToken>
+<trt:ImagingSettings><t:IrCutFilter>{}</t:IrCutFilter></trt:ImagingSettings>
+<trt:ForcePersistence>true</trt:ForcePersistence>
+</trt:SetImagingSettings>"#,
+        token, mode
+    );
+    let xml = match soap_post(&format!("http://{}/onvif/device_service", ip), &body, user, pass).await {
+        Ok(x) => x,
+        Err(_) => return false,
+    };
+    // 成功: 无 Fault
+    !xml.contains("Fault")
 }
 
 // ─── HLS Pipeline ───────────────────────────────────────────
@@ -522,6 +623,12 @@ async fn pipeline_connect(base_url: &str, user: &str, pass: &str) -> Option<Stri
     let _ = Command::new("killall").args(["-9", "rtsp_display"]).output().await;
     let _ = Command::new("killall").args(["weston"]).output().await;
     tokio::time::sleep(Duration::from_millis(200)).await;
+    // weston 退出会关背光 (bl_power=4), 重新打开
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg("echo 0 > /sys/class/backlight/backlight/bl_power 2>/dev/null")
+        .output()
+        .await;
 
     let _ = Command::new("sh")
         .arg("-c")
@@ -714,6 +821,38 @@ async fn handle_hls_stop() -> Response {
     Json(serde_json::json!({"status":"ok"})).into_response()
 }
 
+/// POST /api/ircut — 切换日夜模式 (body: {"mode":"day"} / {"mode":"night"})
+async fn handle_ircut(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if !check_auth(&state, &headers).await { return unauthorized(); }
+
+    let mode = body["mode"].as_str().unwrap_or("").to_string();
+    if mode != "day" && mode != "night" {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"mode must be day or night"}))).into_response();
+    }
+
+    let ip = camera_ip();
+    // 凭据: 从 creds 文件读 user:pass
+    let creds = std::fs::read_to_string(CREDS_FILE).unwrap_or_default();
+    let (user, pass) = match creds.trim().split_once(':') {
+        Some((u, p)) => (u.to_string(), p.to_string()),
+        None => ("admin".to_string(), "123456".to_string()),
+    };
+
+    // 标准 ONVIF: day → OFF (彩色), night → ON (红外)
+    let onvif_mode = if mode == "day" { "OFF" } else { "ON" };
+    let ok = onvif_set_ircut(&ip, &user, &pass, onvif_mode).await;
+
+    if ok {
+        Json(serde_json::json!({"status":"ok","mode":mode})).into_response()
+    } else {
+        (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error":"ircut command failed"}))).into_response()
+    }
+}
+
 // ─── HLS auth middleware ────────────────────────────────────
 
 async fn check_hls_token(params: &HashMap<String, String>) -> bool {
@@ -828,6 +967,12 @@ async fn auto_recover() {
 
                 let _ = Command::new("killall").args(["weston"]).output().await;
                 let _ = Command::new("killall").args(["-9", "rtsp_display"]).output().await;
+                // weston 退出会关背光 (bl_power=4), 重新打开
+                let _ = Command::new("sh")
+                    .arg("-c")
+                    .arg("echo 0 > /sys/class/backlight/backlight/bl_power 2>/dev/null")
+                    .output()
+                    .await;
                 let _ = Command::new("sh")
                     .arg("-c")
                     .arg("cd /root && nohup /root/rtsp_display /root/config.ini </dev/null >/tmp/gst_web.log 2>&1 &")
@@ -877,6 +1022,7 @@ async fn main() {
         .route("/api/status", get(handle_status))
         .route("/api/hls_start", post(handle_hls_start))
         .route("/api/hls_stop", post(handle_hls_stop))
+        .route("/api/ircut", post(handle_ircut))
         .route("/hls/stream.m3u8", get(handle_hls_m3u8))
         .route("/hls/:filename", get(handle_hls_ts))
         .route("/", get(handle_index))
