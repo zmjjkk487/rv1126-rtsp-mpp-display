@@ -49,19 +49,8 @@ void config_parse(const char *path, config_t *c) {
             c->rtsp_pass[sizeof(c->rtsp_pass) - 1] = '\0';
         } else if (!strcmp(key, "rtsp_transport"))
             c->rtsp_transport = strcmp(val, "udp") ? 1 : 0;
-        else if (!strcmp(key, "display_width"))
-            c->display_width = atoi(val);
-        else if (!strcmp(key, "display_height"))
-            c->display_height = atoi(val);
         else if (!strcmp(key, "fb_device"))
             snprintf(c->fb_device, sizeof(c->fb_device), "%s", val);
-        else if (!strcmp(key, "display_type")) {
-            if (!strcmp(val, "drm"))
-                c->display_type = DISPLAY_DRM;
-            else
-                c->display_type = DISPLAY_FBDEV;
-        } else if (!strcmp(key, "target_fps"))
-            c->target_fps = atoi(val);
         else if (!strcmp(key, "log_level")) {
             if (!strcmp(val, "debug"))
                 c->log_level = LOG_DEBUG;

@@ -5,7 +5,7 @@
  *   rtspsrc → rtph264depay → h264parse → mppvideodec → appsink(NV12)
  *   → fb_show_nv12 (RGA 硬转 NV12→BGRX + 等比缩放+黑边) → fbdev 直写
  *
- * 编译: ./build.sh    产物: output/rv1126_gst_display
+ * 编译: ./build.sh    产物: output/rtsp_display
  *
  * 状态: 板端验证通过 (1080p 25fps CPU 15%)
  */
