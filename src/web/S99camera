@@ -1,8 +1,17 @@
 #!/bin/sh
 # S99camera — 摄像头显示系统开机自启
 # 1. 释放显示设备 (杀 weston)
-# 2. 启动 Web 管理后台 (自动恢复上次连接的摄像头)
+# 2. 启动 Web 管理后台 (Rust 版, 自动恢复上次连接的摄像头)
 # 3. 看门狗: 管线/后台进程挂了自动拉起
+
+WEB_PORT=8090
+
+start_web() {
+    # 先杀旧进程释放端口 (看门狗/部署可能留了僵尸实例)
+    killall -9 rv1126_web 2>/dev/null
+    sleep 1
+    /root/rv1126_web >/tmp/web.log 2>&1 &
+}
 
 case "$1" in
 start)
@@ -15,31 +24,30 @@ start)
     # weston 退出会关 MIPI 屏背光 (bl_power=4), 必须重新打开否则黑屏
     echo 0 > /sys/class/backlight/backlight/bl_power 2>/dev/null
 
-    # 启动 Web 管理后台 (它会自动恢复上次连接)
-    if ! pidof rv1126_web >/dev/null 2>&1; then
-        /root/rv1126_web >/tmp/web.log 2>&1 &
-        echo "  Web 后台已启动 (http://<板子IP>:8080)"
+    # 启动 Web 管理后台 (Rust 版; 它会自动恢复上次连接)
+    if ! ss -tlnp 2>/dev/null | grep -q ":$WEB_PORT"; then
+        start_web
+        echo "  Web 后台已启动 (Rust 版, http://<板子IP>:$WEB_PORT)"
+    else
+        echo "  Web 后台已在运行 (端口 $WEB_PORT)"
     fi
 
     # 看门狗: 每 15 秒检查, 掉了就拉起
-    # (启动一个后台循环, 避免 init 脚本阻塞)
     ( while true; do
         sleep 15
-        # Web 后台掉了
-        pidof rv1126_web >/dev/null 2>&1 || /root/rv1126_web >/tmp/web.log 2>&1 &
-        # 管线掉了且有已保存的连接 → 让 web 重连 (web 启动时自动恢复)
+        # Web 后台掉了 (按端口检查, 避免 pidof 误判僵尸进程)
+        ss -tlnp 2>/dev/null | grep -q ":$WEB_PORT" || start_web
+        # 管线掉了且有已保存的连接 → 重启 web 触发自动恢复
         pidof rtsp_display >/dev/null 2>&1 || {
             [ -f /root/last_connect.json ] && {
-                killall -9 rv1126_web 2>/dev/null
-                sleep 1
-                /root/rv1126_web >/tmp/web.log 2>&1 &
+                start_web
             }
         }
     done ) &
     echo "  看门狗已启动"
     ;;
 stop)
-    killall rv1126_web 2>/dev/null
+    killall -9 rv1126_web 2>/dev/null
     for p in $(pidof rtsp_display); do kill -9 $p 2>/dev/null; done
     echo "Stopped."
     ;;

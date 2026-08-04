@@ -413,7 +413,7 @@ cd ~/rv1126_rtsp_mpp_demo
 ./build_gst.sh
 
 # 部署到板子
-scp output_gst/rv1126_gst_display config.ini root@192.168.50.132:/root/
+scp output_gst/rv1126_gst_display config.ini root@<板端IP>:/root/
 
 # 板端运行
 killall weston 2>/dev/null
@@ -461,7 +461,7 @@ chmod +x build.sh
 ```ini
 [network]
 # 摄像头 RTSP 地址 (704×576 H.264 High, 15fps)
-rtsp_url = rtsp://192.168.50.54:554/stream1?username=admin&password=E10ADC3949BA59ABBE56E057F20F883E
+rtsp_url = rtsp://192.168.1.100:554/stream1?username=admin&password=<md5哈希>
 # 传输协议: tcp (可靠) 或 udp (低延迟)
 rtsp_transport = tcp
 

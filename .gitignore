@@ -2,6 +2,11 @@
 output/
 output_native/
 
+# Rust 编译产物 (726MB, 必须忽略)
+src/web_rust/target/
+# Rust 本地交叉编译配置 (含本机工具链路径)
+src/web_rust/.cargo/
+
 # 本地配置文件 (含摄像头密码等凭据, 请复制 config.ini.sample 为 config.ini)
 config.ini
 last_connect.json

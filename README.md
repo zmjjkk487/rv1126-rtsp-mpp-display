@@ -24,7 +24,7 @@ rv1126_web (Web 管理后台, 端口 8080)
 | 进程 | 功能 | 技术 |
 |------|------|------|
 | `rtsp_display` | 显示管线 | GStreamer + MPP 硬解 + RGA 硬转 + fbdev |
-| `rv1126_web` | Web 后台 | 原生 C HTTP Server + ONVIF + HLS |
+| `rv1126_web` | Web 后台 | Rust (axum) + ONVIF + HLS |
 
 ### 数据流
 
@@ -74,13 +74,14 @@ rv1126_rtsp_mpp_demo/
 ├── build.sh                # 交叉编译脚本 (两个二进制)
 │
 ├── src/web/
-│   ├── web_main.c          # HTTP Server (:8080) + 路由 + 认证
-│   ├── onvif_disco.c / .h  # ONVIF WS-Discovery 组播发现
-│   ├── onvif_soap.c / .h   # ONVIF SOAP GetProfiles/GetStreamUri
+│   ├── web_rust/            # Web 管理后台 (Rust + axum)
+│   │   └── src/main.rs       # 全部功能: HTTP/认证/ONVIF/HLS
 │   ├── S99camera            # 开机自启脚本
 │   └── static/
 │       ├── index.html       # Web 管理界面 (扫描/连接/预览/状态)
 │       └── hls.min.js       # HLS.js 播放器
+│
+├── legacy_web/              # 废弃的 C 版 Web 后台 (参考用)
 │
 ├── docs/
 │   ├── DEPLOY.md            # 部署与操作手册

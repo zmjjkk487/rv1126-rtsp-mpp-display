@@ -1,0 +1,895 @@
+// rv1126_web — 嵌入式 Web 管理后台 (Rust 重构)
+// 端口 :8090 | ONVIF 发现 | RTSP 连接 | HLS 预览 | 登录认证
+
+use axum::{
+    extract::{Path, State},
+    http::{header, StatusCode},
+    response::{IntoResponse, Json, Response},
+    routing::{get, post},
+    Router,
+};
+use base64::Engine;
+use rand::Rng;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::fs;
+use tokio::net::UdpSocket;
+use tokio::process::Command;
+use tokio::sync::Mutex;
+
+const STATIC_DIR: &str = "/root/camera-web/static";
+const PASSWD_FILE: &str = "/root/camera-web/passwd";
+const CREDS_FILE: &str = "/root/camera-web/creds";
+const DEFAULT_HASH: &str =
+    "240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9";
+
+// ─── App State ─────────────────────────────────────────────
+
+struct AppState {
+    pw_hash: String,
+    sessions: Mutex<HashMap<String, u64>>,   // token → expiry timestamp
+    login_fails: Mutex<Vec<u64>>,
+}
+
+// ─── JSON Types ─────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct LoginReq {
+    user: Option<String>,
+    pass: Option<String>,
+}
+
+#[derive(Serialize)]
+struct LoginResp {
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ConnectReq {
+    url: Option<String>,
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    pass: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ConnectResp {
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rtsp: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct HlsReq {
+    url: Option<String>,
+}
+
+#[derive(Serialize)]
+struct HlsStartResp {
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hls_token: Option<String>,
+}
+
+#[derive(Serialize)]
+struct DeviceInfo {
+    ip: String,
+    xaddrs: String,
+    name: String,
+    profiles: Vec<ProfileInfo>,
+}
+
+#[derive(Serialize)]
+struct ProfileInfo {
+    token: String,
+    name: String,
+    width: u32,
+    height: u32,
+    uri: String,
+}
+
+#[derive(Serialize)]
+struct ScanResp {
+    devices: Vec<DeviceInfo>,
+    count: usize,
+}
+
+// ─── Auth helpers ───────────────────────────────────────────
+
+fn sha256_hex(s: &str) -> String {
+    let hash = Sha256::digest(s.as_bytes());
+    hex::encode(hash)
+}
+
+fn gen_token() -> String {
+    let mut rng = rand::thread_rng();
+    let bytes: [u8; 16] = rng.gen();
+    hex::encode(bytes)
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn parse_bearer(req: &axum::http::Request<axum::body::Body>) -> Option<String> {
+    req.headers()
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()
+        .and_then(|v| v.strip_prefix("Bearer ").map(|t| t.to_string()))
+}
+
+// ─── ONVIF WS-Discovery ─────────────────────────────────────
+
+const WS_PROBE: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope"
+            xmlns:w="http://schemas.xmlsoap.org/ws/2004/08/addressing"
+            xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery"
+            xmlns:dn="http://www.onvif.org/ver10/network/wsdl">
+<e:Header>
+<w:MessageID>uuid:rv1126-probe</w:MessageID>
+<w:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</w:To>
+<w:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</w:Action>
+</e:Header>
+<e:Body><d:Probe><d:Types>dn:NetworkVideoTransmitter</d:Types></d:Probe></e:Body>
+</e:Envelope>"#;
+
+async fn onvif_discover() -> Vec<(String, String)> {
+    let mut devices = Vec::new();
+    let socket = match UdpSocket::bind("0.0.0.0:0").await {
+        Ok(s) => s,
+        Err(_) => return devices,
+    };
+    let _ = socket.set_broadcast(true);
+    let _ = socket.join_multicast_v4(
+        "239.255.255.250".parse().unwrap(),
+        std::net::Ipv4Addr::UNSPECIFIED,
+    );
+
+    // Send probe 3× (间隔 200ms)
+    for _ in 0..3 {
+        let _ = socket
+            .send_to(WS_PROBE.as_bytes(), "239.255.255.250:3702")
+            .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Collect responses (timeout 2s)
+    let mut buf = [0u8; 4096];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), socket.recv_from(&mut buf)).await {
+            Ok(Ok((n, _src))) => {
+                let xml = String::from_utf8_lossy(&buf[..n]);
+                // Extract XAddrs
+                for cap in xml.match_indices("<d:XAddrs>") {
+                    let start = cap.0 + 10;
+                    if let Some(end) = xml[start..].find("</d:XAddrs>") {
+                        let addrs = &xml[start..start + end];
+                        // XAddrs 可能包含多个地址 (空格分隔, 如 http + https)
+                        // 取第一个, 提取纯 IP
+                        let first = addrs.split_whitespace().next().unwrap_or("");
+                        let ip = first
+                            .split("://")
+                            .nth(1)
+                            .and_then(|s| s.split('/').next())
+                            .and_then(|s| s.split(':').next())
+                            .unwrap_or("")
+                            .to_string();
+                        if !devices.iter().any(|(_, a)| a == first) {
+                            devices.push((ip, first.to_string()));
+                        }
+                    }
+                }
+                // Extract Scopes for name
+            }
+            _ => break,
+        }
+    }
+
+    // 补全: 无论组播是否有结果, 都探测常见 IP (海康/大华不响应组播)
+    // 注意: 必须发 SOAP POST 探测, GET 会返回 HTML 欢迎页 (不是 ONVIF 设备)
+    // 并发探测: 10 个 IP 同时发请求, 总耗时 ≈ 单个超时 (2s) 而非 10×2s
+    const SOAP_PROBE: &str = r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">
+<s:Body xmlns:tds="http://www.onvif.org/ver10/device/wsdl">
+<tds:GetDeviceInformation/>
+</s:Body>
+</s:Envelope>"#;
+    let ips: [i32; 10] = [54, 64, 168, 10, 100, 101, 200, 150, 1, 66];
+    let mut probes = Vec::new();
+    for &last in &ips {
+        let url = format!("http://192.168.50.{}/onvif/device_service", last);
+        probes.push(async move {
+            if let Ok(resp) = reqwest::Client::new()
+                .post(&url)
+                .header("Content-Type", "application/soap+xml; charset=utf-8")
+                .body(SOAP_PROBE)
+                .timeout(Duration::from_millis(800))  // 0.8s 超时, 够局域网内响应
+                .send()
+                .await
+            {
+                let body = resp.text().await.unwrap_or_default();
+                // 必须是 SOAP Envelope 响应才是 ONVIF 设备
+                if body.contains("Envelope") && body.contains("GetDeviceInformationResponse") {
+                    return Some((format!("192.168.50.{}", last), url));
+                }
+            }
+            None
+        });
+    }
+    // 并发执行所有探测
+    let results = futures::future::join_all(probes).await;
+    for r in results.into_iter().flatten() {
+        if !devices.iter().any(|(_, a)| a == &r.1) {
+            devices.push(r);
+        }
+    }
+
+    devices
+}
+
+// ─── ONVIF SOAP ─────────────────────────────────────────────
+
+fn wsse_password_digest(nonce: &[u8], created: &str, password: &str) -> String {
+    let mut hasher = sha1::Sha1::new();
+    sha1::Digest::update(&mut hasher, nonce);
+    sha1::Digest::update(&mut hasher, created.as_bytes());
+    sha1::Digest::update(&mut hasher, password.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(sha1::Digest::finalize(hasher))
+}
+
+fn make_nonce() -> Vec<u8> {
+    rand::random::<[u8; 16]>().to_vec()
+}
+
+/// 构造带 WS-Security 的 ONVIF SOAP 请求体
+fn make_soap_request(user: &str, pass: &str, body: &str) -> String {
+    let nonce = make_nonce();
+    let created = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let digest = wsse_password_digest(&nonce, &created, pass);
+    let nonce_b64 = base64::engine::general_purpose::STANDARD.encode(&nonce);
+
+    format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+            xmlns:trt="http://www.onvif.org/ver10/media/wsdl"
+            xmlns:tds="http://www.onvif.org/ver10/device/wsdl"
+            xmlns:t="http://www.onvif.org/ver10/schema">
+<s:Header>
+<Security s:mustUnderstand="1" xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
+<UsernameToken>
+<Username>{}</Username>
+<Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">{}</Password>
+<Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">{}</Nonce>
+<Created xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">{}</Created>
+</UsernameToken>
+</Security>
+</s:Header>
+<s:Body>{}</s:Body>
+</s:Envelope>"#,
+        user, digest, nonce_b64, created, body
+    )
+}
+
+/// 发送 ONVIF SOAP 请求, 返回响应文本
+/// 认证策略: 先 WS-Security (WSS), 失败/401 回退 HTTP Basic Auth
+/// (海康等品牌对 WSS 支持不稳定, Basic Auth 更可靠)
+async fn soap_post(xaddr: &str, body_xml: &str, user: &str, pass: &str) -> Result<String, ()> {
+    let client = reqwest::Client::new();
+
+    // 1. 尝试 WS-Security
+    let soap = make_soap_request(user, pass, body_xml);
+    let resp = client
+        .post(xaddr)
+        .header("Content-Type", "application/soap+xml; charset=utf-8")
+        .body(soap)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|_| ())?;
+    let text = resp.text().await.map_err(|_| ())?;
+
+    // 2. WSS 失败 (Fault/401) → 回退 Basic Auth
+    if text.contains("<SOAP-ENV:Fault>") || text.contains("Fault") {
+        let soap2 = format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+            xmlns:trt="http://www.onvif.org/ver10/media/wsdl"
+            xmlns:tds="http://www.onvif.org/ver10/device/wsdl">
+<s:Body>{}</s:Body>
+</s:Envelope>"#,
+            body_xml
+        );
+        let resp2 = client
+            .post(xaddr)
+            .basic_auth(user, Some(pass))
+            .header("Content-Type", "application/soap+xml; charset=utf-8")
+            .body(soap2)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|_| ())?;
+        let text2 = resp2.text().await.map_err(|_| ())?;
+        return Ok(text2);
+    }
+
+    Ok(text)
+}
+
+async fn onvif_get_profiles(xaddr: &str, user: &str, pass: &str) -> Vec<ProfileInfo> {
+    let body = "<trt:GetProfiles/>";
+    let xml = match soap_post(xaddr, body, user, pass).await {
+        Ok(x) => x,
+        Err(_) => return vec![],
+    };
+
+    let mut profiles = parse_profiles(&xml);
+
+    // 对每个 profile 获取 RTSP URI (GetStreamUri)
+    // 注意: StreamSetup 内的 Stream/Transport 属于 schema 命名空间 (t:),
+    // 不是 media 命名空间 (trt:) — 用错前缀会导致 Validation constraint violation
+    for p in &mut profiles {
+        let sbody = format!(
+            r#"<trt:GetStreamUri><trt:StreamSetup><t:Stream>RTP-Unicast</t:Stream>
+<t:Transport><t:Protocol>RTSP</t:Protocol></t:Transport></trt:StreamSetup>
+<trt:ProfileToken>{}</trt:ProfileToken></trt:GetStreamUri>"#,
+            p.token
+        );
+        if let Ok(sxml) = soap_post(xaddr, &sbody, user, pass).await {
+            if let Some(uri) = extract_xml_val(&sxml, "tt:Uri", |v| Some(v.to_string())) {
+                p.uri = uri;
+            }
+        }
+    }
+    profiles
+}
+
+fn parse_profiles(xml: &str) -> Vec<ProfileInfo> {
+    let mut profiles = Vec::new();
+    let mut pos = 0;
+    while let Some(start) = xml[pos..].find("<trt:Profiles") {
+        let seg_start = pos + start;
+        pos = seg_start + 1;
+        // token 是 Profiles 元素的属性, 如 <trt:Profiles token="MainStream">
+        let token = if let Some(ts) = xml[seg_start..].find("token=\"") {
+            let from = seg_start + ts + 7;
+            if let Some(te) = xml[from..].find('"') {
+                xml[from..from + te].to_string()
+            } else { String::new() }
+        } else { String::new() };
+        let name = extract_xml_val(&xml[seg_start..], "tt:Name", |v| Some(v.to_string()))
+            .unwrap_or_else(|| token.clone());
+        let width: u32 = extract_xml_val(&xml[seg_start..], "tt:Width", |v| v.parse().ok())
+            .unwrap_or(0);
+        let height: u32 = extract_xml_val(&xml[seg_start..], "tt:Height", |v| v.parse().ok())
+            .unwrap_or(0);
+        // GetStreamUri 在 onvif_get_profiles 中填充
+        let uri = String::new();
+        profiles.push(ProfileInfo { token, name, width, height, uri });
+    }
+    profiles
+}
+
+fn extract_xml_val<T>(xml: &str, tag: &str, f: impl Fn(&str) -> Option<T>) -> Option<T> {
+    let open = format!("<{}>", tag);
+    let close = format!("</{}>", tag);
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)?;
+    f(xml[start..start + end].trim())
+}
+
+// ─── HLS Pipeline ───────────────────────────────────────────
+
+/// 解码 XML 转义 (&amp; → & 等), ONVIF GetStreamUri 返回的 Uri 里有 XML 转义
+fn xml_unescape(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+}
+
+/// 从 URL 提取 host/path, 注入凭据 (从 creds 文件读取, 不在 URL 暴露明文)
+fn inject_creds(url: &str) -> String {
+    let url = xml_unescape(url);
+    // 已带 user:pass@ 凭据 → 直接用
+    if url.contains('@') {
+        return url.to_string();
+    }
+    // 已带 ?username= 凭据 → 直接用 (ONVIF GetStreamUri 返回的形式)
+    if url.contains("username=") {
+        return url.to_string();
+    }
+    // 读取保存的凭据注入
+    if let Ok(creds) = std::fs::read_to_string(CREDS_FILE) {
+        let creds = creds.trim();
+        if !creds.is_empty() {
+            if let Some(at) = url.find("://") {
+                let at = at + 3;
+                return format!("{}{}@{}", &url[..at], creds, &url[at..]);
+            }
+        }
+    }
+    url.to_string()
+}
+
+async fn hls_start(url: &str) -> (String, String) {
+    let tok = gen_token();
+    let _ = tokio::fs::write("/tmp/hls_token", &tok).await;
+
+    // 注入凭据 (creds 文件: user:pass)
+    let authed_url = inject_creds(url);
+
+    // Shell-escape single quotes
+    let safe_url = authed_url.replace('\'', "'\\''");
+
+    // Kill old transcoder
+    let _ = Command::new("killall")
+        .args(["-9", "gst-launch-1.0"])
+        .output()
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg("mkdir -p /root/hls && rm -f /root/hls/*.ts /root/hls/*.m3u8")
+        .output()
+        .await;
+
+    let cmd = format!(
+        "gst-launch-1.0 rtspsrc location='{}' latency=300 \
+         ! rtph264depay ! h264parse \
+         ! hlssink2 location='/root/hls/seg_%05d.ts' \
+         playlist-location='/root/hls/stream.m3u8' \
+         target-duration=2 max-files=30 playlist-length=0 \
+         </dev/null >/tmp/hls.log 2>&1 &",
+        safe_url
+    );
+    let _ = Command::new("sh").arg("-c").arg(&cmd).output().await;
+
+    (tok, safe_url)
+}
+
+fn hls_playlist(token: &str) -> String {
+    let mut m3u8 = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:3\n".to_string();
+    let mut seqs: Vec<i32> = Vec::new();
+
+    if let Ok(dir) = std::fs::read_dir("/root/hls") {
+        for entry in dir.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some(num) = name.strip_prefix("seg_").and_then(|s| s.strip_suffix(".ts")) {
+                if let Ok(n) = num.parse::<i32>() {
+                    seqs.push(n);
+                }
+            }
+        }
+    }
+
+    seqs.sort_unstable();
+    let usable = if seqs.len() > 1 { seqs.len() - 1 } else { 0 };
+    let start = if usable > 5 { usable - 5 } else { 0 };
+
+    if usable > 0 {
+        m3u8.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{}\n", seqs[start]));
+        for i in start..usable {
+            m3u8.push_str(&format!(
+                "\n#EXTINF:2,\nseg_{:05}.ts?t={}\n",
+                seqs[i], token
+            ));
+        }
+    } else {
+        m3u8.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
+    }
+
+    m3u8
+}
+
+// ─── Pipeline Control ───────────────────────────────────────
+
+async fn pipeline_connect(base_url: &str, user: &str, pass: &str) -> Option<String> {
+    // Save credentials
+    let _ = fs::write(CREDS_FILE, format!("{}:{}\n", user, pass)).await;
+
+    // Save config.ini
+    let cfg = format!(
+        "[network]\nrtsp_url = {}\nrtsp_transport = tcp\n\n[log]\nlog_level = info\n",
+        base_url
+    );
+    let _ = fs::write("/root/config.ini", &cfg).await;
+
+    // Save last_connect
+    let _ = fs::write(
+        "/root/last_connect.json",
+        format!("{{\"url\":\"{}\"}}\n", base_url),
+    )
+    .await;
+
+    // Restart pipeline
+    let _ = Command::new("killall").args(["-9", "rtsp_display"]).output().await;
+    let _ = Command::new("killall").args(["weston"]).output().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg("cd /root && nohup /root/rtsp_display /root/config.ini </dev/null >/tmp/gst_web.log 2>&1 &")
+        .output()
+        .await;
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // Read PID
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg("pgrep -f rtsp_display")
+        .output()
+        .await
+        .ok()?;
+    let pid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Some(if pid.is_empty() { "0".into() } else { pid })
+}
+
+/// 从 URL 中提取 user:pass@ 并返回 (base_url, user, pass)
+fn split_url_creds(url: &str) -> (String, String, String) {
+    let mut user = String::new();
+    let mut pass = String::new();
+    if let Some(at_pos) = url.find('@') {
+        if let Some(proto) = url.find("://") {
+            let creds = &url[proto + 3..at_pos];
+            if let Some(colon) = creds.find(':') {
+                user = creds[..colon].to_string();
+                pass = creds[colon + 1..].to_string();
+            } else {
+                user = creds.to_string();
+            }
+            let base = format!("{}{}", &url[..proto + 3], &url[at_pos + 1..]);
+            return (base, user, pass);
+        }
+    }
+    (url.to_string(), user, pass)
+}
+
+// ─── Auth helper ────────────────────────────────────────────
+
+async fn check_auth(state: &AppState, headers: &axum::http::HeaderMap) -> bool {
+    if let Some(auth) = headers.get(header::AUTHORIZATION) {
+        if let Ok(val) = auth.to_str() {
+            if let Some(token) = val.strip_prefix("Bearer ") {
+                let sessions = state.sessions.lock().await;
+                return sessions.contains_key(token);
+            }
+        }
+    }
+    false
+}
+
+fn unauthorized() -> Response {
+    (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"unauthorized"}))).into_response()
+}
+
+// ─── HTTP Handlers ──────────────────────────────────────────
+
+async fn handle_login(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<LoginReq>,
+) -> Response {
+    let fails = state.login_fails.lock().await;
+    let now = now_secs();
+    let recent: usize = fails.iter().filter(|&&t| now - t < 300).count();
+    drop(fails);
+    if recent >= 5 {
+        return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({"error":"too many attempts, try later"}))).into_response();
+    }
+
+    let pass = req.pass.unwrap_or_default();
+    if pass.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"missing password"}))).into_response();
+    }
+
+    if sha256_hex(&pass) != state.pw_hash {
+        state.login_fails.lock().await.push(now);
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error":"wrong user or password"}))).into_response();
+    }
+
+    state.login_fails.lock().await.clear();
+    let token = gen_token();
+    state.sessions.lock().await.insert(token.clone(), now + 86400);
+    (StatusCode::OK, Json(serde_json::json!({"status":"ok","token":token}))).into_response()
+}
+
+async fn handle_logout(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if let Some(auth) = headers.get(header::AUTHORIZATION) {
+        if let Ok(val) = auth.to_str() {
+            if let Some(tok) = val.strip_prefix("Bearer ") {
+                state.sessions.lock().await.remove(tok);
+            }
+        }
+    }
+    let _ = std::fs::remove_file("/tmp/hls_token");
+    let _ = Command::new("killall").args(["-9", "gst-launch-1.0"]).output().await;
+    Json(serde_json::json!({"status":"ok"})).into_response()
+}
+
+async fn handle_scan(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if !check_auth(&state, &headers).await { return unauthorized(); }
+
+    // 发现设备 + 获取 profiles 全部并行
+    let discovered = onvif_discover().await;
+    let mut tasks = Vec::new();
+    for (ip, xaddr) in &discovered {
+        let xaddr = xaddr.clone();
+        let ip2 = ip.clone();
+        tasks.push(async move {
+            // 尝试默认凭据 (并行尝试, 取第一个成功的)
+            let blank = onvif_get_profiles(&xaddr, "admin", "");
+            let pass1 = onvif_get_profiles(&xaddr, "admin", "123456");
+            let pass2 = onvif_get_profiles(&xaddr, "admin", "admin");
+            let (blank, pass1, pass2) = tokio::join!(blank, pass1, pass2);
+            let profs = if !blank.is_empty() { blank }
+                        else if !pass1.is_empty() { pass1 }
+                        else { pass2 };
+            DeviceInfo { ip: ip2.clone(), xaddrs: xaddr, name: ip2, profiles: profs }
+        });
+    }
+    let devices: Vec<DeviceInfo> = futures::future::join_all(tasks).await;
+    let count = devices.len();
+    Json(ScanResp { devices, count }).into_response()
+}
+
+async fn handle_connect(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if !check_auth(&state, &headers).await { return unauthorized(); }
+
+    let url = body["url"].as_str().unwrap_or("").to_string();
+    if url.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"missing url"}))).into_response();
+    }
+
+    // JSON 里的 user/pass 优先, 否则从 URL 提取
+    let json_user = body["user"].as_str().unwrap_or("").to_string();
+    let json_pass = body["pass"].as_str().unwrap_or("").to_string();
+    let (base_url, url_user, url_pass) = split_url_creds(&url);
+    let user = if json_user.is_empty() { if url_user.is_empty() { "admin".to_string() } else { url_user } } else { json_user };
+    let pass = if json_pass.is_empty() { url_pass } else { json_pass };
+
+    let pid = pipeline_connect(&base_url, &user, &pass).await;
+    (StatusCode::OK, Json(serde_json::json!({"status":"ok","pid":pid,"rtsp":base_url}))).into_response()
+}
+
+async fn handle_status(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if !check_auth(&state, &headers).await { return unauthorized(); }
+    let running = Command::new("pgrep").args(["-f", "rtsp_display"]).output().await
+        .map(|o| !o.stdout.is_empty()).unwrap_or(false);
+    Json(serde_json::json!({"running":running})).into_response()
+}
+
+async fn handle_hls_start(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if !check_auth(&state, &headers).await { return unauthorized(); }
+    let url = body["url"].as_str().unwrap_or("").to_string();
+    if url.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"missing url"}))).into_response();
+    }
+    let (tok, _) = hls_start(&url).await;
+    (StatusCode::OK, Json(serde_json::json!({"status":"ok","hls_token":tok}))).into_response()
+}
+
+async fn handle_hls_stop() -> Response {
+    let _ = Command::new("killall").args(["-9", "gst-launch-1.0"]).output().await;
+    let _ = std::fs::remove_file("/tmp/hls_token");
+    Json(serde_json::json!({"status":"ok"})).into_response()
+}
+
+// ─── HLS auth middleware ────────────────────────────────────
+
+async fn check_hls_token(params: &HashMap<String, String>) -> bool {
+    if let Some(tok) = params.get("t") {
+        if let Ok(stored) = tokio::fs::read_to_string("/tmp/hls_token").await {
+            return stored.trim() == tok.trim();
+        }
+    }
+    false
+}
+
+async fn handle_hls_m3u8(raw_query: axum::extract::RawQuery) -> impl IntoResponse {
+    let params = parse_query(raw_query.0.as_deref());
+    if !check_hls_token(&params).await {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    let tok = params.get("t").map(|s| s.as_str()).unwrap_or("");
+    (StatusCode::OK, hls_playlist(tok)).into_response()
+}
+
+/// 静态文件服务 (替代 nest_service: 它会把 /hls/* 请求也吞掉导致 404)
+async fn handle_static(
+    Path(filename): Path<String>,
+) -> impl IntoResponse {
+    // 防目录穿越
+    if filename.contains("..") {
+        return (StatusCode::FORBIDDEN, "forbidden").into_response();
+    }
+    serve_file(&format!("{}/{}", STATIC_DIR, filename)).await
+}
+
+/// 首页 (/) → index.html
+async fn handle_index() -> impl IntoResponse {
+    serve_file(&format!("{}/index.html", STATIC_DIR)).await
+}
+
+async fn serve_file(path: &str) -> Response {
+    match tokio::fs::read(path).await {
+        Ok(data) => {
+            let ct = if path.ends_with(".html") {
+                "text/html; charset=utf-8"
+            } else if path.ends_with(".js") {
+                "application/javascript"
+            } else if path.ends_with(".css") {
+                "text/css"
+            } else {
+                "application/octet-stream"
+            };
+            (StatusCode::OK, [(header::CONTENT_TYPE, ct)], data).into_response()
+        }
+        Err(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
+}
+
+/// 手动解析 query string (axum 0.7 中 Path+Query 组合有兼容问题,
+/// query 会被并进 Path, 导致带 ?t= 的分片请求 404)
+fn parse_query(raw: Option<&str>) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    if let Some(q) = raw {
+        for pair in q.split('&') {
+            if let Some(eq) = pair.find('=') {
+                map.insert(pair[..eq].to_string(), pair[eq + 1..].to_string());
+            }
+        }
+    }
+    map
+}
+
+async fn handle_hls_ts(
+    Path(filename): Path<String>,
+    raw_query: axum::extract::RawQuery,
+) -> impl IntoResponse {
+    let params = parse_query(raw_query.0.as_deref());
+    if !check_hls_token(&params).await {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    // Sanitize
+    if filename.contains("..") {
+        return (StatusCode::FORBIDDEN, "forbidden").into_response();
+    }
+    let path = format!("/root/hls/{}", filename);
+    match tokio::fs::read(&path).await {
+        Ok(data) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "video/MP2T")],
+            data,
+        )
+            .into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
+}
+
+// ─── Main ───────────────────────────────────────────────────
+
+async fn auto_recover() {
+    if Command::new("pgrep").args(["-f", "rtsp_display"]).output().await
+        .map(|o| !o.stdout.is_empty()).unwrap_or(false) {
+        return; // already running
+    }
+
+    if let Ok(data) = tokio::fs::read_to_string("/root/last_connect.json").await {
+        if let Some(url_start) = data.find("\"url\":\"") {
+            let url = &data[url_start + 7..];
+            if let Some(url_end) = url.find('"') {
+                let base_url = &url[..url_end];
+                let cfg = format!(
+                    "[network]\nrtsp_url = {}\nrtsp_transport = tcp\n\n[log]\nlog_level = info\n",
+                    base_url
+                );
+                let _ = tokio::fs::write("/root/config.ini", &cfg).await;
+                println!("自动恢复: {}", base_url);
+
+                let _ = Command::new("killall").args(["weston"]).output().await;
+                let _ = Command::new("killall").args(["-9", "rtsp_display"]).output().await;
+                let _ = Command::new("sh")
+                    .arg("-c")
+                    .arg("cd /root && nohup /root/rtsp_display /root/config.ini </dev/null >/tmp/gst_web.log 2>&1 &")
+                    .output()
+                    .await;
+            }
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    // Init password
+    let pw_hash = match tokio::fs::read_to_string(PASSWD_FILE).await {
+        Ok(data) => {
+            if let Some(colon) = data.find(':') {
+                data[colon + 1..].trim().to_string()
+            } else {
+                DEFAULT_HASH.to_string()
+            }
+        }
+        Err(_) => {
+            let _ = tokio::fs::write(
+                PASSWD_FILE,
+                format!("admin:{}\n", DEFAULT_HASH),
+            )
+            .await;
+            DEFAULT_HASH.to_string()
+        }
+    };
+
+    let state = Arc::new(AppState {
+        pw_hash,
+        sessions: Mutex::new(HashMap::new()),
+        login_fails: Mutex::new(Vec::new()),
+    });
+
+    // Auto-recover last camera
+    auto_recover().await;
+
+    // Build router
+    let app = Router::new()
+        .route("/api/login", post(handle_login))
+        .route("/api/logout", post(handle_logout))
+        .route("/api/scan", get(handle_scan))
+        .route("/api/connect", post(handle_connect))
+        .route("/api/status", get(handle_status))
+        .route("/api/hls_start", post(handle_hls_start))
+        .route("/api/hls_stop", post(handle_hls_stop))
+        .route("/hls/stream.m3u8", get(handle_hls_m3u8))
+        .route("/hls/:filename", get(handle_hls_ts))
+        .route("/", get(handle_index))
+        .route("/:filename", get(handle_static))
+        .with_state(state);
+
+    // bind 失败不 panic: 看门狗或部署脚本可能留了旧进程占着 8090,
+    // panic 会掩盖真正的问题 (端口冲突), 优雅报错退出即可
+    let listener = match tokio::net::TcpListener::bind("0.0.0.0:8090").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("ERROR: bind 8090 失败: {}", e);
+            eprintln!("提示: 可能有旧 rv1126_web 进程还在, 执行 killall -9 rv1126_web 后重试");
+            std::process::exit(1);
+        }
+    };
+    println!("rv1126_web (Rust) 已启动: http://0.0.0.0:8090");
+    if let Err(e) = axum::serve(listener, app).await {
+        eprintln!("ERROR: 服务异常退出: {}", e);
+        std::process::exit(1);
+    }
+}

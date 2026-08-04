@@ -52,16 +52,25 @@ echo ""
 echo "管道: rtspsrc → depay → parse → mppvideodec → appsink → RGA → fbdev"
 echo "============================================"
 
-# ---- Web 管理后台 (ONVIF 发现) ----
-WEB_BIN="$OUTDIR/rv1126_web"
+# ---- Web 管理后台 (Rust 版) ----
 echo ""
-echo "编译 Web 管理后台..."
-WEB_CFLAGS="--sysroot=$SYSROOT -Wall -O2 -g -std=c11 $CFLAGS"
-WEB_LDFLAGS="--sysroot=$SYSROOT -L$SYSROOT/usr/lib -lcurl -lcrypto -lm"
-WEB_SRCS="src/web/web_main.c src/web/onvif_disco.c src/web/onvif_soap.c"
-$CC $WEB_CFLAGS -o "$WEB_BIN" $WEB_SRCS $WEB_LDFLAGS
-echo "编译成功: $WEB_BIN"
-echo "文件大小: $(ls -lh "$WEB_BIN" | awk '{print $5}')"
+echo "编译 Web 管理后台 (Rust)..."
+WEB_SRC="src/web_rust"
+WEB_BIN="$OUTDIR/rv1126_web"
+
+if command -v cargo >/dev/null 2>&1; then
+    cd "$WEB_SRC"
+    CC_aarch64_unknown_linux_gnu="$CC" \
+    AR_aarch64_unknown_linux_gnu="${TC}/bin/aarch64-buildroot-linux-gnu-ar" \
+    cargo build --release --target aarch64-unknown-linux-gnu 2>&1 | tail -3
+    cd ../..
+    cp "$WEB_SRC/target/aarch64-unknown-linux-gnu/release/rv1126_web" "$WEB_BIN"
+    echo "编译成功: $WEB_BIN"
+    echo "文件大小: $(ls -lh "$WEB_BIN" | awk '{print $5}')"
+else
+    echo "错误: 未找到 cargo, 无法编译 Rust Web 后台"
+    exit 1
+fi
 echo ""
 echo "部署:"
 echo "  scp $WEB_BIN root@<IP>:/root/"

@@ -84,7 +84,7 @@ ssh root@<板子IP> "chmod +x /etc/init.d/S99camera"
 
 ```ini
 [network]
-rtsp_url = rtsp://admin:123456@192.168.50.168:554/stream0   # 摄像头地址
+rtsp_url = rtsp://admin:password@192.168.1.100:554/stream0   # 摄像头地址 (凭据单独存 creds 文件)
 rtsp_transport = tcp
 [log]
 log_level = info
