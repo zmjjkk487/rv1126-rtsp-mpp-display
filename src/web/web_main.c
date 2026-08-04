@@ -127,9 +127,11 @@ static void handle_login(int fd, const char *body) {
     http_ok(fd, "application/json", resp);
 }
 
-/* === API: POST /api/logout — 注销 session === */
+/* === API: POST /api/logout — 注销 session 并清理 HLS === */
 static void handle_logout(int fd) {
     remove(SESSION_FILE);
+    remove("/tmp/hls_token");
+    system("killall -9 gst-launch-1.0 2>/dev/null");
     http_ok(fd, "application/json", "{\"status\":\"ok\"}");
 }
 static void url_decode(char *dst, const char *src, size_t sz) {
@@ -154,14 +156,58 @@ static void url_decode(char *dst, const char *src, size_t sz) {
     *dst = '\0';
 }
 
-/* === 工具: 简易 JSON 字符串转义 === */
+/* === 工具: 简易 JSON 字符串转义 + HTML 实体编码 === */
 static void json_escape(char *dst, const char *src, size_t sz) {
     size_t pos = 0;
-    while (*src && pos < sz - 1) {
-        if (*src == '"' || *src == '\\') { dst[pos++] = '\\'; if (pos >= sz - 1) break; }
-        dst[pos++] = *src++;
+    while (*src && pos < sz - 8) {  /* 留足最坏 case: &#39; = 5 chars */
+        if (*src == '"')  { dst[pos++] = '\\'; dst[pos++] = '"'; }
+        else if (*src == '\\') { dst[pos++] = '\\'; dst[pos++] = '\\'; }
+        else if (*src == '&')  { memcpy(dst+pos, "&amp;", 5); pos += 5; }
+        else if (*src == '<')  { memcpy(dst+pos, "&lt;", 4);  pos += 4; }
+        else if (*src == '>')  { memcpy(dst+pos, "&gt;", 4);  pos += 4; }
+        else if (*src == '\'') { memcpy(dst+pos, "&#39;", 5); pos += 5; }
+        else dst[pos++] = *src;
+        src++;
     }
     dst[pos] = '\0';
+}
+
+/* === 工具: shell 单引号转义 (用于 safe system() 调用) === */
+static void shell_escape_sq(char *dst, const char *src, size_t sz) {
+    size_t pos = 0;
+    while (*src && pos < sz - 5) {
+        if (*src == '\'') {
+            /* 在单引号内部嵌入字面单引号: 关引号 → 转义引号 → 开引号 */
+            memcpy(dst + pos, "'\\''", 4);
+            pos += 4;
+        } else {
+            dst[pos++] = *src;
+        }
+        src++;
+    }
+    dst[pos] = '\0';
+}
+
+/* === 工具: 从 URL query string 中提取 token 参数 === */
+static int check_token_param(const char *path) {
+    const char *t = strstr(path, "?t=");
+    if (!t) t = strstr(path, "&t=");
+    if (!t) return 0;
+    t += 3;
+    char token[64];
+    int i;
+    for (i = 0; i < 63 && t[i] && t[i] != '&' && t[i] != ' '; i++)
+        token[i] = t[i];
+    token[i] = '\0';
+    if (!token[0]) return 0;
+    FILE *fp = fopen("/tmp/hls_token", "r");
+    if (!fp) return 0;
+    char stored[64] = "";
+    fgets(stored, sizeof(stored), fp);
+    fclose(fp);
+    size_t sl = strlen(stored);
+    while (sl > 0 && (stored[sl-1] == '\n' || stored[sl-1] == '\r')) stored[--sl] = '\0';
+    return strcmp(token, stored) == 0;
 }
 
 /* === HTTP 响应助手 === */
@@ -469,11 +515,16 @@ static void handle_request(int fd) {
         return;
     }
 
-    /* GET /hls/stream.m3u8 — 动态生成 live playlist
-     * hlssink2 只写分片文件, 其自带 playlist 是 VOD 型 (冻结不滚动),
-     * 这里每次请求实时扫描分片文件生成 live m3u8
-     */
+    /* GET /hls/stream.m3u8 — 动态生成 live playlist (需要 HLS token) */
     if (strcmp(method, "GET") == 0 && strcmp(decoded, "/hls/stream.m3u8") == 0) {
+        if (!check_token_param(path)) { http_401(fd); close(fd); return; }
+        /* 提取 token 用于注入到分片 URL */
+        const char *tok = strstr(path, "?t=") ? strstr(path, "?t=") + 3 : "";
+        char tok_val[64] = "";
+        for (int ti = 0; ti < 63 && tok[ti] && tok[ti] != '&'; ti++)
+            tok_val[ti] = tok[ti];
+        tok_val[63] = '\0';
+
         char m3u8[8192];
         int pos = snprintf(m3u8, sizeof(m3u8),
             "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:3\n");
@@ -502,7 +553,7 @@ static void handle_request(int fd) {
                 "#EXT-X-MEDIA-SEQUENCE:%d\n", seqs[start]);
             for (int i = start; i < usable; i++) {
                 pos += snprintf(m3u8 + pos, sizeof(m3u8) - pos,
-                    "\n#EXTINF:2,\nseg_%05d.ts\n", seqs[i]);
+                    "\n#EXTINF:2,\nseg_%05d.ts?t=%s\n", seqs[i], tok_val);
             }
         } else {
             pos += snprintf(m3u8 + pos, sizeof(m3u8) - pos,
@@ -513,10 +564,17 @@ static void handle_request(int fd) {
         return;
     }
 
-    /* GET /hls/* — HLS 流文件 (GStreamer 分片输出到 /root/hls/) */
+    /* GET /hls/*.ts — HLS 分片文件 (需要 HLS token) */
     if (strcmp(method, "GET") == 0 && strncmp(decoded, "/hls/", 5) == 0) {
+        if (!check_token_param(path)) { http_401(fd); close(fd); return; }
+        /* 去掉 ?t=... 参数获取真实文件名 */
+        char clean[256];
+        strncpy(clean, decoded + 5, sizeof(clean) - 1);
+        clean[sizeof(clean) - 1] = '\0';
+        char *q = strchr(clean, '?');
+        if (q) *q = '\0';
         char file[512];
-        snprintf(file, sizeof(file), "/root/hls/%s", decoded + 5);
+        snprintf(file, sizeof(file), "/root/hls/%s", clean);
         /* 防目录穿越 */
         if (strstr(decoded, "..")) {
             http_err(fd, 403, "Forbidden");
@@ -544,7 +602,7 @@ static void handle_request(int fd) {
         return;
     }
 
-    /* POST /api/hls_start — 启动 ffmpeg RTSP→HLS 转码
+    /* POST /api/hls_start — 启动 GStreamer RTSP→HLS 转码
      * body: {"url":"rtsp://..."} */
     if (strcmp(method, "POST") == 0 && strcmp(decoded, "/api/hls_start") == 0) {
         if (!check_auth(buf)) { http_401(fd); close(fd); return; }
@@ -560,6 +618,16 @@ static void handle_request(int fd) {
             return;
         }
 
+        /* Shell 单引号转义: 防命令注入 */
+        char safe_url[1024];
+        shell_escape_sq(safe_url, url, sizeof(safe_url));
+
+        /* 生成 HLS 临时 token (用于视频流认证) */
+        char hls_tok[33];
+        gen_token(hls_tok);
+        FILE *tf = fopen("/tmp/hls_token", "w");
+        if (tf) { fprintf(tf, "%s\n", hls_tok); fclose(tf); }
+
         /* 先停旧转码 */
         system("killall -9 gst-launch-1.0 2>/dev/null");
         usleep(300000);
@@ -573,12 +641,12 @@ static void handle_request(int fd) {
             "! hlssink2 location='/root/hls/seg_%%05d.ts' "
             "playlist-location='/root/hls/stream.m3u8' "
             "target-duration=2 max-files=30 playlist-length=0 "
-            "</dev/null >/tmp/hls.log 2>&1 &", url);
+            "</dev/null >/tmp/hls.log 2>&1 &", safe_url);
         system(cmd);
 
         char resp[256];
         snprintf(resp, sizeof(resp),
-            "{\"status\":\"ok\",\"hls\":\"http://<board_ip>:8080/hls/stream.m3u8\"}");
+            "{\"status\":\"ok\",\"hls_token\":\"%s\"}", hls_tok);
         http_ok(fd, "application/json", resp);
         close(fd);
         return;
@@ -588,6 +656,7 @@ static void handle_request(int fd) {
     if (strcmp(method, "POST") == 0 && strcmp(decoded, "/api/hls_stop") == 0) {
         if (!check_auth(buf)) { http_401(fd); close(fd); return; }
         system("killall -9 gst-launch-1.0 2>/dev/null");
+        remove("/tmp/hls_token");
         http_ok(fd, "application/json", "{\"status\":\"ok\"}");
         close(fd);
         return;

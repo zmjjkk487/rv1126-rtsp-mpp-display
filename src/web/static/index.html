@@ -187,6 +187,7 @@ document.getElementById('login-pass').addEventListener('keydown', function(e) {
 
 /* === 退出 === */
 function doLogout() {
+  stopPreview();
   fetch('/api/logout', {method: 'POST', headers: apiHeaders()}).catch(()=>{});
   sessionStorage.removeItem('web_token');
   AUTH_TOKEN = '';
@@ -219,9 +220,11 @@ function startPreview(rtspUrl) {
     body: JSON.stringify({url: rtspUrl})
   }).then(r => r.json()).then(d => {
     if (d.status !== 'ok') { alert('启动预览失败: '+JSON.stringify(d)); return; }
+    let hlsTok = d.hls_token || '';
     setTimeout(() => {
       let video = document.getElementById('preview-video');
-      let hlsUrl = window.location.origin + '/hls/stream.m3u8';
+      let hlsUrl = window.location.origin + '/hls/stream.m3u8'
+                 + (hlsTok ? '?t=' + hlsTok : '');
       if (window.Hls && window.Hls.isSupported()) {
         hlsPlayer = new Hls({
           liveDurationInfinity: true,
