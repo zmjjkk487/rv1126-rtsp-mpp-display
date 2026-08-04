@@ -26,6 +26,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <dirent.h>
+#include <time.h>
 
 #include "onvif_disco.h"
 #include "onvif_soap.h"
@@ -37,7 +38,10 @@
 #define BUF_SIZE     16384
 #define STATIC_DIR   "/root/camera-web/static"
 #define PASSWD_FILE  "/root/camera-web/passwd"
-#define SESSION_FILE "/tmp/web_token"
+#define SESSION_DIR  "/tmp/web_sessions"
+#define LOGIN_FAILS  "/tmp/login_fails"
+#define MAX_FAILURES 5
+#define FAIL_WINDOW  300
 #define DEFAULT_HASH "240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9"
 static char g_passwd_hash[65] = "";
 
@@ -74,14 +78,10 @@ static int check_auth(const char *req) {
         token[i] = auth[i];
     token[i] = '\0';
     if (!token[0]) return 0;
-    FILE *fp = fopen(SESSION_FILE, "r");
-    if (!fp) return 0;
-    char stored[64] = "";
-    fgets(stored, sizeof(stored), fp);
-    fclose(fp);
-    size_t sl = strlen(stored);
-    while (sl > 0 && (stored[sl-1] == '\n' || stored[sl-1] == '\r')) stored[--sl] = '\0';
-    return strcmp(token, stored) == 0;
+    char spath[128];
+    snprintf(spath, sizeof(spath), SESSION_DIR "/%s", token);
+    /* 只检查文件存在性, 不再比对内容 → 支持多 session */
+    return access(spath, F_OK) == 0;
 }
 
 /* === HTTP 401 未授权响应 === */
@@ -99,8 +99,37 @@ static void http_401(int fd) {
     send(fd, body, strlen(body), MSG_NOSIGNAL);
 }
 
-/* === API: POST /api/login — 验证账号密码, 返回 session token === */
+/* === 工具: 登录失败计数 (全局, 非 per-IP, 嵌入式简化) === */
+static int login_throttled(void) {
+    FILE *fp = fopen(LOGIN_FAILS, "r");
+    if (!fp) return 0;
+    time_t now = time(NULL);
+    int count = 0;
+    char line[32];
+    while (fgets(line, sizeof(line), fp)) {
+        time_t ts = (time_t)atol(line);
+        if (now - ts < FAIL_WINDOW) count++;
+    }
+    fclose(fp);
+    return count >= MAX_FAILURES;
+}
+
+static void login_record_fail(void) {
+    FILE *fp = fopen(LOGIN_FAILS, "a");
+    if (fp) { fprintf(fp, "%ld\n", (long)time(NULL)); fclose(fp); }
+}
+
+static void login_clear_fails(void) {
+    remove(LOGIN_FAILS);
+}
+
+/* === API: POST /api/login — 验证账号密码, 返回 session token (多 session) === */
 static void handle_login(int fd, const char *body) {
+    if (login_throttled()) {
+        http_err(fd, 429, "{\"error\":\"too many attempts, try later\"}");
+        return;
+    }
+
     char user[64] = "", pass[64] = "";
     const char *u = strstr(body, "\"user\":\"");
     const char *p = strstr(body, "\"pass\":\"");
@@ -111,15 +140,20 @@ static void handle_login(int fd, const char *body) {
     char hash[65];
     sha256_hex(pass, hash);
     if (strcmp(hash, g_passwd_hash) != 0) {
+        login_record_fail();
         http_err(fd, 403, "{\"error\":\"wrong user or password\"}");
         return;
     }
 
+    login_clear_fails();
+    mkdir(SESSION_DIR, 0700);
+
     char token[33];
     gen_token(token);
-    FILE *fp = fopen(SESSION_FILE, "w");
+    char spath[128];
+    snprintf(spath, sizeof(spath), SESSION_DIR "/%s", token);
+    FILE *fp = fopen(spath, "w");
     if (!fp) { http_err(fd, 500, "{\"error\":\"session error\"}"); return; }
-    fprintf(fp, "%s\n", token);
     fclose(fp);
 
     char resp[256];
@@ -127,9 +161,22 @@ static void handle_login(int fd, const char *body) {
     http_ok(fd, "application/json", resp);
 }
 
-/* === API: POST /api/logout — 注销 session 并清理 HLS === */
-static void handle_logout(int fd) {
-    remove(SESSION_FILE);
+/* === API: POST /api/logout — 注销 session (删除自己的 session 文件) 并清理 HLS === */
+static void handle_logout(int fd, const char *req) {
+    const char *auth = strstr(req, "Authorization: Bearer ");
+    if (auth) {
+        auth += 22;
+        char token[64];
+        int i;
+        for (i = 0; i < 63 && auth[i] && auth[i] != '\r' && auth[i] != '\n'; i++)
+            token[i] = auth[i];
+        token[i] = '\0';
+        if (token[0]) {
+            char spath[128];
+            snprintf(spath, sizeof(spath), SESSION_DIR "/%s", token);
+            remove(spath);
+        }
+    }
     remove("/tmp/hls_token");
     system("killall -9 gst-launch-1.0 2>/dev/null");
     http_ok(fd, "application/json", "{\"status\":\"ok\"}");
@@ -674,7 +721,7 @@ static void handle_request(int fd) {
     /* POST /api/logout — 注销 (需要认证) */
     if (strcmp(method, "POST") == 0 && strcmp(decoded, "/api/logout") == 0) {
         if (!check_auth(buf)) { http_401(fd); close(fd); return; }
-        handle_logout(fd);
+        handle_logout(fd, buf);
         close(fd);
         return;
     }
@@ -718,6 +765,11 @@ int main(void) {
         memcpy(g_passwd_hash, DEFAULT_HASH, 64);
         g_passwd_hash[64] = '\0';
     }
+
+    /* 清理旧的 session 文件和登录失败计数 */
+    system("rm -rf " SESSION_DIR " 2>/dev/null");
+    mkdir(SESSION_DIR, 0700);
+    remove(LOGIN_FAILS);
 
     int server = socket(AF_INET, SOCK_STREAM, 0);
     if (server < 0) { perror("socket"); return 1; }
