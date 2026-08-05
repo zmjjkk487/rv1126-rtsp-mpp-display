@@ -29,7 +29,7 @@ const DEFAULT_HASH: &str =
 // ─── App State ─────────────────────────────────────────────
 
 struct AppState {
-    pw_hash: String,
+    pw_hash: Mutex<String>,
     sessions: Mutex<HashMap<String, u64>>,   // token → expiry timestamp
     login_fails: Mutex<Vec<u64>>,
 }
@@ -493,6 +493,65 @@ async fn onvif_set_ircut(ip: &str, user: &str, pass: &str, mode: &str) -> bool {
     !xml.contains("Fault")
 }
 
+/// 读取摄像头网卡配置 (ONVIF GetNetworkInterfaces)
+/// 返回 (interface_token, dhcp, ip, prefix)
+async fn onvif_get_network(ip: &str, user: &str, pass: &str) -> Option<(String, bool, String, String)> {
+    let body = "<tds:GetNetworkInterfaces/>";
+    let xml = soap_post(&format!("http://{}/onvif/device_service", ip), body, user, pass).await.ok()?;
+    if xml.contains("Fault") { return None; }
+
+    let token = extract_xml_val(&xml, "tds:NetworkInterfaces", |v| Some(v.to_string()))
+        .and_then(|_| {
+            // 提取 token 属性
+            let start = xml.find("<tds:NetworkInterfaces")?;
+            let seg = &xml[start..];
+            let ts = seg.find("token=\"")? + 7;
+            let te = seg[ts..].find('"')?;
+            Some(seg[ts..ts + te].to_string())
+        })
+        .unwrap_or_else(|| "eth0".to_string());
+
+    let dhcp = extract_xml_val(&xml, "tt:DHCP", |v| Some(v.to_string()))
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    let addr = extract_xml_val(&xml, "tt:Address", |v| Some(v.to_string()))
+        .unwrap_or_default();
+    let prefix = extract_xml_val(&xml, "tt:PrefixLength", |v| Some(v.to_string()))
+        .unwrap_or_else(|| "24".to_string());
+
+    Some((token, dhcp, addr, prefix))
+}
+
+/// 设置摄像头网段 (ONVIF SetNetworkInterfaces)
+/// mode: "dhcp" 或 "static" (static 需 ip/prefix/gateway)
+async fn onvif_set_network(ip: &str, user: &str, pass: &str,
+                           interface: &str, dhcp: bool,
+                           address: &str, prefix: &str) -> bool {
+    let body = if dhcp {
+        format!(
+            r#"<tds:SetNetworkInterfaces><tds:InterfaceToken>{}</tds:InterfaceToken>
+<tds:NetworkInterface><tt:Enabled>true</tt:Enabled>
+<tt:IPv4><tt:Enabled>true</tt:Enabled><tt:Config><tt:DHCP>true</tt:DHCP></tt:Config></tt:IPv4>
+</tds:NetworkInterface></tds:SetNetworkInterfaces>"#,
+            interface
+        )
+    } else {
+        format!(
+            r#"<tds:SetNetworkInterfaces><tds:InterfaceToken>{}</tds:InterfaceToken>
+<tds:NetworkInterface><tt:Enabled>true</tt:Enabled>
+<tt:IPv4><tt:Enabled>true</tt:Enabled><tt:Config><tt:DHCP>false</tt:DHCP>
+<tt:Manual><tt:Address>{}</tt:Address><tt:PrefixLength>{}</tt:PrefixLength></tt:Manual>
+</tt:Config></tt:IPv4></tds:NetworkInterface></tds:SetNetworkInterfaces>"#,
+            interface, address, prefix
+        )
+    };
+    let xml = match soap_post(&format!("http://{}/onvif/device_service", ip), &body, user, pass).await {
+        Ok(x) => x,
+        Err(_) => return false,
+    };
+    !xml.contains("Fault")
+}
+
 // ─── HLS Pipeline ───────────────────────────────────────────
 
 /// 解码 XML 转义 (&amp; → & 等), ONVIF GetStreamUri 返回的 Uri 里有 XML 转义
@@ -622,11 +681,23 @@ async fn pipeline_connect(base_url: &str, user: &str, pass: &str) -> Option<Stri
     // Restart pipeline
     let _ = Command::new("killall").args(["-9", "rtsp_display"]).output().await;
     let _ = Command::new("killall").args(["weston"]).output().await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    // weston 退出会关背光 (bl_power=4), 重新打开
+    // 等 weston 完全退出 (最多 5 秒), 否则它退出时会写 bl_power=4 关背光
+    for _ in 0..10 {
+        let alive = Command::new("sh").arg("-c").arg("pidof weston").output().await
+            .map(|o| !o.stdout.is_empty()).unwrap_or(false);
+        if !alive { break; }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    // weston 已退出, 开背光不会被覆盖
     let _ = Command::new("sh")
         .arg("-c")
         .arg("echo 0 > /sys/class/backlight/backlight/bl_power 2>/dev/null")
+        .output()
+        .await;
+    // 激活 CRTC: 杀 weston 释放显示控制器, 不激活则黑屏
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg("modetest -M rockchip -s 96@73:720x1280 >/tmp/modetest.log 2>&1 &")
         .output()
         .await;
 
@@ -706,7 +777,7 @@ async fn handle_login(
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"missing password"}))).into_response();
     }
 
-    if sha256_hex(&pass) != state.pw_hash {
+    if sha256_hex(&pass) != *state.pw_hash.lock().await {
         state.login_fails.lock().await.push(now);
         return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error":"wrong user or password"}))).into_response();
     }
@@ -715,6 +786,150 @@ async fn handle_login(
     let token = gen_token();
     state.sessions.lock().await.insert(token.clone(), now + 86400);
     (StatusCode::OK, Json(serde_json::json!({"status":"ok","token":token}))).into_response()
+}
+
+/// POST /api/change_password — 修改登录密码
+/// body: {"old_pass":"...","new_pass":"..."}
+async fn handle_change_password(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    // 需要登录
+    if !check_auth(&state, &headers).await { return unauthorized(); }
+
+    let old_pass = body["old_pass"].as_str().unwrap_or("").to_string();
+    let new_pass = body["new_pass"].as_str().unwrap_or("").to_string();
+
+    if old_pass.is_empty() || new_pass.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"missing old_pass/new_pass"}))).into_response();
+    }
+    if new_pass.len() < 6 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"new password too short (min 6)"}))).into_response();
+    }
+
+    // 验证旧密码
+    if sha256_hex(&old_pass) != *state.pw_hash.lock().await {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error":"old password wrong"}))).into_response();
+    }
+
+    // 写新密码 hash 到文件
+    let new_hash = sha256_hex(&new_pass);
+    let content = format!("admin:{}\n", new_hash);
+    if let Err(_) = tokio::fs::write(PASSWD_FILE, content).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"write failed"}))).into_response();
+    }
+
+    // 更新内存
+    *state.pw_hash.lock().await = new_hash;
+    // 清空所有 session (强制重新登录)
+    state.sessions.lock().await.clear();
+
+    (StatusCode::OK, Json(serde_json::json!({"status":"ok"}))).into_response()
+}
+
+/// 获取 eth0 的 connman service 名 (按 MAC 动态生成)
+async fn get_eth_service() -> String {
+    let out = Command::new("connmanctl").arg("services").output().await;
+    if let Ok(o) = out {
+        let text = String::from_utf8_lossy(&o.stdout);
+        for line in text.lines() {
+            if line.contains("Wired") {
+                if let Some(svc) = line.split_whitespace().find(|s| s.starts_with("ethernet_")) {
+                    return svc.to_string();
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+/// GET /api/network — 查询当前网络配置
+async fn handle_network_get(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if !check_auth(&state, &headers).await { return unauthorized(); }
+
+    let svc = get_eth_service().await;
+    let mut method = "unknown";
+    let mut ip = String::new();
+    let mut netmask = String::new();
+    let mut gateway = String::new();
+
+    // 从 connmanctl services 输出解析 IPv4
+    if !svc.is_empty() {
+        let out = Command::new("connmanctl").arg("services").arg(&svc).output().await;
+        if let Ok(o) = out {
+            let text = String::from_utf8_lossy(&o.stdout);
+            for line in text.lines() {
+                let t = line.trim();
+                if t.starts_with("IPv4 =") && t.contains("Method=") {
+                    if t.contains("Method=dhcp") { method = "dhcp"; }
+                    else if t.contains("Method=manual") { method = "static"; }
+                    if let Some(pos) = t.find("Address=") {
+                        ip = t[pos + 8..].split(',').next().unwrap_or("").trim().to_string();
+                    }
+                    if let Some(pos) = t.find("Netmask=") {
+                        netmask = t[pos + 8..].split(',').next().unwrap_or("").trim().to_string();
+                    }
+                    if let Some(pos) = t.find("Gateway=") {
+                        gateway = t[pos + 8..].split(',').next().unwrap_or("").trim().to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    Json(serde_json::json!({
+        "method": method,
+        "ip": ip,
+        "netmask": netmask,
+        "gateway": gateway,
+        "service": svc
+    })).into_response()
+}
+
+/// POST /api/network — 修改网络配置
+/// body: {"method":"dhcp"} 或 {"method":"static","ip":"...","netmask":"...","gateway":"..."}
+async fn handle_network_set(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if !check_auth(&state, &headers).await { return unauthorized(); }
+
+    let svc = get_eth_service().await;
+    if svc.is_empty() {
+        return (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error":"ethernet service not found"}))).into_response();
+    }
+
+    let method = body["method"].as_str().unwrap_or("").to_string();
+
+    if method == "dhcp" {
+        // 恢复 DHCP
+        let _ = Command::new("connmanctl").args(["config", &svc, "--ipv4", "dhcp"]).output().await;
+        return (StatusCode::OK, Json(serde_json::json!({"status":"ok","method":"dhcp"}))).into_response();
+    }
+
+    if method == "static" {
+        let ip = body["ip"].as_str().unwrap_or("").to_string();
+        let netmask = body["netmask"].as_str().unwrap_or("255.255.255.0").to_string();
+        let gateway = body["gateway"].as_str().unwrap_or("").to_string();
+
+        if ip.is_empty() || gateway.is_empty() {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"ip and gateway required"}))).into_response();
+        }
+
+        let _ = Command::new("connmanctl")
+            .args(["config", &svc, "--ipv4", "manual", &ip, &netmask, &gateway])
+            .output()
+            .await;
+
+        return (StatusCode::OK, Json(serde_json::json!({"status":"ok","method":"static","ip":ip}))).into_response();
+    }
+
+    (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"method must be dhcp or static"}))).into_response()
 }
 
 async fn handle_logout(
@@ -853,6 +1068,74 @@ async fn handle_ircut(
     }
 }
 
+/// GET /api/camera_network — 读摄像头网卡配置
+async fn handle_camera_network_get(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if !check_auth(&state, &headers).await { return unauthorized(); }
+
+    let ip = camera_ip();
+    let creds = std::fs::read_to_string(CREDS_FILE).unwrap_or_default();
+    let (user, pass) = match creds.trim().split_once(':') {
+        Some((u, p)) => (u.to_string(), p.to_string()),
+        None => ("admin".to_string(), "123456".to_string()),
+    };
+
+    match onvif_get_network(&ip, &user, &pass).await {
+        Some((token, dhcp, addr, prefix)) => {
+            Json(serde_json::json!({
+                "status":"ok", "interface":token, "dhcp":dhcp,
+                "ip":addr, "prefix":prefix
+            })).into_response()
+        }
+        None => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error":"get network failed"}))).into_response(),
+    }
+}
+
+/// POST /api/camera_network — 修改摄像头网段
+/// body: {"method":"dhcp"} 或 {"method":"static","ip":"...","prefix":"24"}
+async fn handle_camera_network_set(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if !check_auth(&state, &headers).await { return unauthorized(); }
+
+    let ip = camera_ip();
+    let creds = std::fs::read_to_string(CREDS_FILE).unwrap_or_default();
+    let (user, pass) = match creds.trim().split_once(':') {
+        Some((u, p)) => (u.to_string(), p.to_string()),
+        None => ("admin".to_string(), "123456".to_string()),
+    };
+
+    // 先读当前网卡 token
+    let (interface, _, _, _) = match onvif_get_network(&ip, &user, &pass).await {
+        Some(v) => v,
+        None => ("eth0".to_string(), false, String::new(), "24".to_string()),
+    };
+
+    let method = body["method"].as_str().unwrap_or("").to_string();
+    let ok = if method == "dhcp" {
+        onvif_set_network(&ip, &user, &pass, &interface, true, "", "").await
+    } else if method == "static" {
+        let addr = body["ip"].as_str().unwrap_or("").to_string();
+        let prefix = body["prefix"].as_str().unwrap_or("24").to_string();
+        if addr.is_empty() {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"ip required"}))).into_response();
+        }
+        onvif_set_network(&ip, &user, &pass, &interface, false, &addr, &prefix).await
+    } else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"method must be dhcp or static"}))).into_response();
+    };
+
+    if ok {
+        Json(serde_json::json!({"status":"ok","method":method})).into_response()
+    } else {
+        (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error":"set network failed"}))).into_response()
+    }
+}
+
 // ─── HLS auth middleware ────────────────────────────────────
 
 async fn check_hls_token(params: &HashMap<String, String>) -> bool {
@@ -966,11 +1249,24 @@ async fn auto_recover() {
                 println!("自动恢复: {}", base_url);
 
                 let _ = Command::new("killall").args(["weston"]).output().await;
+                // 等 weston 完全退出, 否则退出时写 bl_power=4 关背光
+                for _ in 0..10 {
+                    let alive = Command::new("sh").arg("-c").arg("pidof weston").output().await
+                        .map(|o| !o.stdout.is_empty()).unwrap_or(false);
+                    if !alive { break; }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
                 let _ = Command::new("killall").args(["-9", "rtsp_display"]).output().await;
-                // weston 退出会关背光 (bl_power=4), 重新打开
+                // weston 已退出, 开背光不会被覆盖
                 let _ = Command::new("sh")
                     .arg("-c")
                     .arg("echo 0 > /sys/class/backlight/backlight/bl_power 2>/dev/null")
+                    .output()
+                    .await;
+                // 激活 CRTC: 杀 weston 释放显示控制器, 不激活则黑屏
+                let _ = Command::new("sh")
+                    .arg("-c")
+                    .arg("modetest -M rockchip -s 96@73:720x1280 >/tmp/modetest.log 2>&1 &")
                     .output()
                     .await;
                 let _ = Command::new("sh")
@@ -1005,7 +1301,7 @@ async fn main() {
     };
 
     let state = Arc::new(AppState {
-        pw_hash,
+        pw_hash: Mutex::new(pw_hash),
         sessions: Mutex::new(HashMap::new()),
         login_fails: Mutex::new(Vec::new()),
     });
@@ -1017,6 +1313,9 @@ async fn main() {
     let app = Router::new()
         .route("/api/login", post(handle_login))
         .route("/api/logout", post(handle_logout))
+        .route("/api/change_password", post(handle_change_password))
+        .route("/api/network", get(handle_network_get).post(handle_network_set))
+        .route("/api/camera_network", get(handle_camera_network_get).post(handle_camera_network_set))
         .route("/api/scan", get(handle_scan))
         .route("/api/connect", post(handle_connect))
         .route("/api/status", get(handle_status))

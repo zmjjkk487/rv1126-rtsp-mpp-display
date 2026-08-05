@@ -31,6 +31,11 @@ start)
     # weston 已退出, 现在开背光不会被覆盖
     echo 0 > /sys/class/backlight/backlight/bl_power 2>/dev/null
 
+    # 激活 CRTC (显示控制器): 杀 weston 会释放 CRTC, 不重新激活则屏幕黑屏
+    # 一旦激活即保持, 后续管线重启不影响
+    modetest -M rockchip -s 96@73:720x1280 >/tmp/modetest.log 2>&1 &
+    sleep 1
+
     # 启动 Web 管理后台 (Rust 版; 它会自动恢复上次连接)
     if ! ss -tlnp 2>/dev/null | grep -q ":$WEB_PORT"; then
         start_web

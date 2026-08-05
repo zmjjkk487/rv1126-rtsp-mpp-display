@@ -117,6 +117,40 @@ pre{background:#0a0e17;padding:10px;border-radius:8px;overflow-x:auto;font-size:
     <h3>&#x2139;&#xFE0F; 系统状态</h3>
     <div id="status-info"><span class="status status-yellow"></span> 检查中...</div>
   </div>
+  <div class="card">
+    <h3>&#x1F4F6; 网络设置</h3>
+    <div id="network-info"><span class="status status-yellow"></span> 加载中...</div>
+    <div style="margin-top:10px">
+      <label>连接方式</label>
+      <select id="net-method">
+        <option value="dhcp">DHCP (自动获取)</option>
+        <option value="static">静态 IP</option>
+      </select>
+      <label>IP 地址</label>
+      <input id="net-ip" placeholder="192.168.1.100">
+      <label>子网掩码</label>
+      <input id="net-mask" placeholder="255.255.255.0">
+      <label>网关</label>
+      <input id="net-gateway" placeholder="192.168.1.1">
+    </div>
+    <div style="margin-top:12px">
+      <button class="btn btn-primary" onclick="saveNetwork()">&#x1F4C4; 保存网络设置</button>
+    </div>
+    <div id="network-msg" style="margin-top:8px;font-size:12px;color:#94a3b8"></div>
+  </div>
+  <div class="card">
+    <h3>&#x1F511; 修改密码</h3>
+    <label>旧密码</label>
+    <input id="old-pass" type="password" placeholder="请输入当前密码" autocomplete="current-password">
+    <label>新密码 (至少 6 位)</label>
+    <input id="new-pass" type="password" placeholder="请输入新密码" autocomplete="new-password">
+    <label>确认新密码</label>
+    <input id="confirm-pass" type="password" placeholder="再次输入新密码" autocomplete="new-password">
+    <div style="margin-top:12px">
+      <button class="btn btn-primary" onclick="doChangePassword()">&#x1F511; 确认修改</button>
+    </div>
+    <div id="change-pass-msg" style="margin-top:8px;font-size:12px;color:#94a3b8"></div>
+  </div>
 </div>
 </div><!-- /main-ui -->
 
@@ -185,6 +219,106 @@ document.getElementById('login-pass').addEventListener('keydown', function(e) {
   if (e.key === 'Enter') doLogin();
 });
 
+/* === 修改密码 === */
+async function doChangePassword() {
+  let oldPass = document.getElementById('old-pass').value;
+  let newPass = document.getElementById('new-pass').value;
+  let confirmPass = document.getElementById('confirm-pass').value;
+  let msgEl = document.getElementById('change-pass-msg');
+
+  if (!oldPass || !newPass) { msgEl.textContent = '请输入旧密码和新密码'; return; }
+  if (newPass.length < 6) { msgEl.textContent = '新密码至少 6 位'; return; }
+  if (newPass !== confirmPass) { msgEl.textContent = '两次输入的新密码不一致'; return; }
+
+  msgEl.textContent = '修改中...';
+  try {
+    let r = await apiFetch('/api/change_password', {
+      method: 'POST',
+      body: JSON.stringify({old_pass: oldPass, new_pass: newPass})
+    });
+    let d = await r.json();
+    if (d.status === 'ok') {
+      msgEl.style.color = '#22c55e';
+      msgEl.textContent = '密码修改成功，请重新登录';
+      // 清空输入
+      document.getElementById('old-pass').value = '';
+      document.getElementById('new-pass').value = '';
+      document.getElementById('confirm-pass').value = '';
+      // 5 秒后强制退出重新登录
+      setTimeout(() => { doLogout(); }, 2000);
+    } else {
+      msgEl.style.color = '#ef4444';
+      msgEl.textContent = d.error || '修改失败';
+    }
+  } catch(e) {
+    if (e.message !== 'unauthorized') {
+      msgEl.style.color = '#ef4444';
+      msgEl.textContent = '请求失败: ' + e.message;
+    }
+  }
+}
+
+/* === 网络设置 === */
+let netLoaded = false;
+
+async function loadNetwork() {
+  try {
+    let r = await apiFetch('/api/network');
+    let d = await r.json();
+    let info = document.getElementById('network-info');
+    info.innerHTML = '<span class="status status-green"></span> 当前: '
+      + (d.method === 'dhcp' ? 'DHCP' : '静态') + ' | IP: ' + (d.ip || '-')
+      + ' | 网关: ' + (d.gateway || '-');
+    document.getElementById('net-method').value = d.method === 'static' ? 'static' : 'dhcp';
+    document.getElementById('net-ip').value = d.ip || '';
+    document.getElementById('net-mask').value = d.netmask || '255.255.255.0';
+    document.getElementById('net-gateway').value = d.gateway || '';
+    netLoaded = true;
+  } catch(e) {
+    if (e.message !== 'unauthorized') {
+      document.getElementById('network-info').innerHTML = '<span class="status status-red"></span> 无法获取网络配置';
+    }
+  }
+}
+
+async function saveNetwork() {
+  let msgEl = document.getElementById('network-msg');
+  let method = document.getElementById('net-method').value;
+  let body;
+
+  if (method === 'static') {
+    let ip = document.getElementById('net-ip').value;
+    let mask = document.getElementById('net-mask').value;
+    let gw = document.getElementById('net-gateway').value;
+    if (!ip || !gw) { msgEl.textContent = '静态模式需要填写 IP 和网关'; return; }
+    body = {method: 'static', ip: ip, netmask: mask, gateway: gw};
+  } else {
+    body = {method: 'dhcp'};
+  }
+
+  msgEl.textContent = '保存中...';
+  try {
+    let r = await apiFetch('/api/network', {
+      method: 'POST',
+      body: JSON.stringify(body)
+    });
+    let d = await r.json();
+    if (d.status === 'ok') {
+      msgEl.style.color = '#22c55e';
+      msgEl.textContent = '已保存' + (method === 'static' ? ' (IP: ' + d.ip + ')' : ' (DHCP)');
+      setTimeout(loadNetwork, 3000);
+    } else {
+      msgEl.style.color = '#ef4444';
+      msgEl.textContent = d.error || '保存失败';
+    }
+  } catch(e) {
+    if (e.message !== 'unauthorized') {
+      msgEl.style.color = '#ef4444';
+      msgEl.textContent = '请求失败: ' + e.message;
+    }
+  }
+}
+
 /* === 退出 === */
 function doLogout() {
   stopPreview();
@@ -202,7 +336,7 @@ function showTab(tab) {
   });
   document.getElementById('panel-'+tab).classList.remove('hidden');
   document.getElementById('tab-'+tab).classList.add('active');
-  if (tab === 'status') checkStatus();
+  if (tab === 'status') { checkStatus(); loadNetwork(); }
   if (tab === 'scan' && !document.getElementById('scan-result').innerHTML) doScan();
 }
 
