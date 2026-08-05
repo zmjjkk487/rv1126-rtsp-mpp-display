@@ -118,7 +118,7 @@ pre{background:#0a0e17;padding:10px;border-radius:8px;overflow-x:auto;font-size:
     <div id="status-info"><span class="status status-yellow"></span> 检查中...</div>
   </div>
   <div class="card">
-    <h3>&#x1F4F6; 网络设置</h3>
+    <h3>&#x1F4F6; 板子网络设置</h3>
     <div id="network-info"><span class="status status-yellow"></span> 加载中...</div>
     <div style="margin-top:10px">
       <label>连接方式</label>
@@ -134,9 +134,29 @@ pre{background:#0a0e17;padding:10px;border-radius:8px;overflow-x:auto;font-size:
       <input id="net-gateway" placeholder="192.168.1.1">
     </div>
     <div style="margin-top:12px">
-      <button class="btn btn-primary" onclick="saveNetwork()">&#x1F4C4; 保存网络设置</button>
+      <button class="btn btn-primary" onclick="saveNetwork()">&#x1F4C4; 保存板子网络</button>
     </div>
     <div id="network-msg" style="margin-top:8px;font-size:12px;color:#94a3b8"></div>
+  </div>
+  <div class="card">
+    <h3>&#x1F4F7; 摄像头网段设置</h3>
+    <div id="camnet-info"><span class="status status-yellow"></span> 加载中...</div>
+    <div style="margin-top:10px">
+      <label>摄像头连接方式</label>
+      <select id="camnet-method">
+        <option value="dhcp">DHCP (自动获取)</option>
+        <option value="static">静态 IP</option>
+      </select>
+      <label>摄像头 IP 地址</label>
+      <input id="camnet-ip" placeholder="192.168.1.200">
+      <label>子网前缀</label>
+      <input id="camnet-prefix" placeholder="24">
+    </div>
+    <div style="margin-top:12px">
+      <button class="btn btn-primary" onclick="saveCamNetwork()">&#x1F4C4; 保存摄像头网段</button>
+    </div>
+    <div id="camnet-msg" style="margin-top:8px;font-size:12px;color:#94a3b8"></div>
+    <p style="margin-top:8px;font-size:11px;color:#64748b">&#x26A0;&#xFE0F; 修改后摄像头 IP 会变化, 连接会断开, 需用新 IP 重新连接</p>
   </div>
   <div class="card">
     <h3>&#x1F511; 修改密码</h3>
@@ -307,6 +327,67 @@ async function saveNetwork() {
       msgEl.style.color = '#22c55e';
       msgEl.textContent = '已保存' + (method === 'static' ? ' (IP: ' + d.ip + ')' : ' (DHCP)');
       setTimeout(loadNetwork, 3000);
+    } else {
+      msgEl.style.color = '#ef4444';
+      msgEl.textContent = d.error || '保存失败';
+    }
+  } catch(e) {
+    if (e.message !== 'unauthorized') {
+      msgEl.style.color = '#ef4444';
+      msgEl.textContent = '请求失败: ' + e.message;
+    }
+  }
+}
+
+/* === 摄像头网段设置 === */
+async function loadCamNetwork() {
+  try {
+    let r = await apiFetch('/api/camera_network');
+    let d = await r.json();
+    let info = document.getElementById('camnet-info');
+    if (d.status === 'ok') {
+      info.innerHTML = '<span class="status status-green"></span> 当前: '
+        + (d.dhcp ? 'DHCP' : '静态') + ' | IP: ' + (d.ip || '-')
+        + ' | 前缀: ' + (d.prefix || '-');
+      document.getElementById('camnet-method').value = d.dhcp ? 'dhcp' : 'static';
+      document.getElementById('camnet-ip').value = d.ip || '';
+      document.getElementById('camnet-prefix').value = d.prefix || '24';
+    } else {
+      info.innerHTML = '<span class="status status-red"></span> 摄像头不支持或读取失败: ' + (d.error || '');
+    }
+  } catch(e) {
+    if (e.message !== 'unauthorized') {
+      document.getElementById('camnet-info').innerHTML = '<span class="status status-red"></span> 无法获取摄像头网络配置';
+    }
+  }
+}
+
+async function saveCamNetwork() {
+  let msgEl = document.getElementById('camnet-msg');
+  let method = document.getElementById('camnet-method').value;
+  let body;
+
+  if (method === 'static') {
+    let ip = document.getElementById('camnet-ip').value;
+    let prefix = document.getElementById('camnet-prefix').value || '24';
+    if (!ip) { msgEl.textContent = '静态模式需要填写 IP'; return; }
+    body = {method: 'static', ip: ip, prefix: prefix};
+  } else {
+    body = {method: 'dhcp'};
+  }
+
+  msgEl.textContent = '保存中...';
+  try {
+    let r = await apiFetch('/api/camera_network', {
+      method: 'POST',
+      body: JSON.stringify(body)
+    });
+    let d = await r.json();
+    if (d.status === 'ok') {
+      msgEl.style.color = '#22c55e';
+      msgEl.textContent = '已发送修改命令' + (method === 'static' ? ' (IP: ' + body.ip + ')' : ' (DHCP)')
+        + ' — 摄像头 IP 即将变化, 如断开请用新 IP 重新连接';
+      setTimeout(loadCamNetwork, 5000);
     } else {
       msgEl.style.color = '#ef4444';
       msgEl.textContent = d.error || '保存失败';

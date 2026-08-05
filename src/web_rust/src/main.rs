@@ -268,7 +268,8 @@ fn make_soap_request(user: &str, pass: &str, body: &str) -> String {
 <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
             xmlns:trt="http://www.onvif.org/ver10/media/wsdl"
             xmlns:tds="http://www.onvif.org/ver10/device/wsdl"
-            xmlns:t="http://www.onvif.org/ver10/schema">
+            xmlns:t="http://www.onvif.org/ver10/schema"
+            xmlns:tt="http://www.onvif.org/ver10/schema">
 <s:Header>
 <Security s:mustUnderstand="1" xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
 <UsernameToken>
@@ -295,7 +296,8 @@ fn make_plain_soap(body_xml: &str) -> String {
 <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
             xmlns:trt="http://www.onvif.org/ver10/media/wsdl"
             xmlns:tds="http://www.onvif.org/ver10/device/wsdl"
-            xmlns:t="http://www.onvif.org/ver10/schema">
+            xmlns:t="http://www.onvif.org/ver10/schema"
+            xmlns:tt="http://www.onvif.org/ver10/schema">
 <s:Body>{}</s:Body>
 </s:Envelope>"#,
         body_xml
