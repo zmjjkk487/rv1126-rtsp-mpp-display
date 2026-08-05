@@ -1070,6 +1070,105 @@ async fn handle_ircut(
     }
 }
 
+/// GET /api/system_info — 系统信息 (版本/内存/运行时长/网络)
+async fn handle_system_info(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if !check_auth(&state, &headers).await { return unauthorized(); }
+
+    // 内存
+    let mut mem_total = String::new();
+    let mut mem_free = String::new();
+    if let Ok(data) = std::fs::read_to_string("/proc/meminfo") {
+        for line in data.lines() {
+            if line.starts_with("MemTotal:") { mem_total = line.split_whitespace().nth(1).unwrap_or("").to_string(); }
+            if line.starts_with("MemAvailable:") { mem_free = line.split_whitespace().nth(1).unwrap_or("").to_string(); }
+        }
+    }
+
+    // 运行时长
+    let mut uptime = String::new();
+    if let Ok(data) = std::fs::read_to_string("/proc/uptime") {
+        let secs: f64 = data.split_whitespace().next().unwrap_or("0").parse().unwrap_or(0.0);
+        uptime = format!("{:.0} 秒 ({:.1} 小时)", secs, secs / 3600.0);
+    }
+
+    // 固件版本 (构建时间)
+    let build = env!("CARGO_PKG_VERSION");
+
+    // 当前摄像头
+    let camera = camera_ip();
+    let pipeline_running = Command::new("pgrep").args(["-f", "rtsp_display"]).output().await
+        .map(|o| !o.stdout.is_empty()).unwrap_or(false);
+
+    Json(serde_json::json!({
+        "status":"ok",
+        "version": build,
+        "uptime": uptime,
+        "mem_total_kb": mem_total,
+        "mem_free_kb": mem_free,
+        "camera": camera,
+        "pipeline_running": pipeline_running
+    })).into_response()
+}
+
+/// POST /api/power — 重启或关机 (body: {"action":"reboot"} / {"action":"shutdown"})
+async fn handle_power(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if !check_auth(&state, &headers).await { return unauthorized(); }
+
+    let action = body["action"].as_str().unwrap_or("").to_string();
+    if action != "reboot" && action != "shutdown" {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"action must be reboot or shutdown"}))).into_response();
+    }
+
+    // 先响应, 再执行 (否则连接会断)
+    let cmd = if action == "reboot" { "reboot" } else { "poweroff -f" };
+    let _ = Command::new("sh").arg("-c").arg(format!("sleep 1 && {}", cmd)).output().await;
+    Json(serde_json::json!({"status":"ok","action":action})).into_response()
+}
+
+/// GET /api/logs — 查看系统日志 (尾 N 行)
+/// query: ?file=gst|web|hls|all&lines=100
+async fn handle_logs(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    raw_query: axum::extract::RawQuery,
+) -> Response {
+    if !check_auth(&state, &headers).await { return unauthorized(); }
+
+    let params = parse_query(raw_query.0.as_deref());
+    let file = params.get("file").map(|s| s.as_str()).unwrap_or("all");
+    let lines: usize = params.get("lines").and_then(|s| s.parse().ok()).unwrap_or(100);
+
+    // 日志文件映射
+    let files: Vec<(&str, &str)> = match file {
+        "gst" => vec![("显示管线", "/tmp/gst_web.log")],
+        "web" => vec![("Web 后台", "/tmp/web.log")],
+        "hls" => vec![("HLS 转码", "/tmp/hls.log")],
+        _ => vec![
+            ("显示管线", "/tmp/gst_web.log"),
+            ("Web 后台", "/tmp/web.log"),
+            ("HLS 转码", "/tmp/hls.log"),
+        ],
+    };
+
+    let mut result = serde_json::Map::new();
+    for (name, path) in &files {
+        let content = std::fs::read_to_string(path).unwrap_or_default();
+        let tail: Vec<&str> = content.lines().rev().take(lines).collect();
+        let mut tail_vec = tail.clone();
+        tail_vec.reverse();
+        result.insert(name.to_string(), serde_json::json!(tail_vec));
+    }
+
+    Json(serde_json::json!({"status":"ok","logs":result})).into_response()
+}
+
 /// GET /api/camera_network — 读摄像头网卡配置
 async fn handle_camera_network_get(
     State(state): State<Arc<AppState>>,
@@ -1318,6 +1417,9 @@ async fn main() {
         .route("/api/change_password", post(handle_change_password))
         .route("/api/network", get(handle_network_get).post(handle_network_set))
         .route("/api/camera_network", get(handle_camera_network_get).post(handle_camera_network_set))
+        .route("/api/system_info", get(handle_system_info))
+        .route("/api/power", post(handle_power))
+        .route("/api/logs", get(handle_logs))
         .route("/api/scan", get(handle_scan))
         .route("/api/connect", post(handle_connect))
         .route("/api/status", get(handle_status))

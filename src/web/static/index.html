@@ -118,6 +118,33 @@ pre{background:#0a0e17;padding:10px;border-radius:8px;overflow-x:auto;font-size:
     <div id="status-info"><span class="status status-yellow"></span> 检查中...</div>
   </div>
   <div class="card">
+    <h3>&#x1F5A5;&#xFE0F; 系统信息</h3>
+    <div id="sys-info" style="font-size:13px;line-height:1.8;color:#94a3b8">
+      <span class="status status-yellow"></span> 加载中...
+    </div>
+  </div>
+  <div class="card">
+    <h3>&#x1F4CB; 日志查看</h3>
+    <div style="display:flex;gap:6px;margin-bottom:8px">
+      <select id="log-file" style="flex:1">
+        <option value="all">全部</option>
+        <option value="gst">显示管线</option>
+        <option value="web">Web 后台</option>
+        <option value="hls">HLS 转码</option>
+      </select>
+      <button class="btn btn-primary" style="margin:0;padding:8px 14px" onclick="loadLogs()">&#x1F504; 刷新</button>
+    </div>
+    <pre id="log-content" style="max-height:300px;overflow-y:auto;white-space:pre-wrap;font-size:11px">点击刷新查看日志</pre>
+  </div>
+  <div class="card">
+    <h3>&#x1F50C; 电源操作</h3>
+    <div style="display:flex;gap:10px">
+      <button class="btn btn-primary" onclick="doPower('reboot')">&#x1F501; 重启系统</button>
+      <button class="btn btn-danger" onclick="doPower('shutdown')">&#x23FB;&#xFE0F; 关机</button>
+    </div>
+    <div id="power-msg" style="margin-top:8px;font-size:12px;color:#94a3b8"></div>
+  </div>
+  <div class="card">
     <h3>&#x1F4F6; 板子网络设置</h3>
     <div id="network-info"><span class="status status-yellow"></span> 加载中...</div>
     <div style="margin-top:10px">
@@ -278,6 +305,72 @@ async function doChangePassword() {
   }
 }
 
+/* === 系统信息 === */
+async function loadSysInfo() {
+  try {
+    let r = await apiFetch('/api/system_info');
+    let d = await r.json();
+    let el = document.getElementById('sys-info');
+    if (d.status !== 'ok') { el.innerHTML = '<span class="status status-red"></span> 获取失败'; return; }
+    let memPct = d.mem_total_kb ? Math.round((1 - d.mem_free_kb / d.mem_total_kb) * 100) : 0;
+    el.innerHTML =
+      '<span class="status status-green"></span> 固件版本: v' + (d.version || '-') + '<br>' +
+      '运行时长: ' + (d.uptime || '-') + '<br>' +
+      '内存: ' + Math.round(d.mem_free_kb/1024) + 'MB / ' + Math.round(d.mem_total_kb/1024) + 'MB (' + memPct + '% 已用)<br>' +
+      '当前摄像头: ' + (d.camera || '-') + '<br>' +
+      '管线: ' + (d.pipeline_running ? '<span style="color:#22c55e">运行中</span>' : '<span style="color:#ef4444">未运行</span>');
+  } catch(e) {
+    if (e.message !== 'unauthorized')
+      document.getElementById('sys-info').innerHTML = '<span class="status status-red"></span> 获取失败';
+  }
+}
+
+/* === 日志查看 === */
+async function loadLogs() {
+  let file = document.getElementById('log-file').value;
+  let el = document.getElementById('log-content');
+  el.textContent = '加载中...';
+  try {
+    let r = await apiFetch('/api/logs?file=' + file + '&lines=100');
+    let d = await r.json();
+    if (d.status !== 'ok') { el.textContent = '获取失败: ' + (d.error || ''); return; }
+    let text = '';
+    for (let [name, lines] of Object.entries(d.logs)) {
+      text += '── ' + name + ' ──\n';
+      text += lines.join('\n') + '\n\n';
+    }
+    el.textContent = text || '(空)';
+    el.scrollTop = el.scrollHeight;
+  } catch(e) {
+    if (e.message !== 'unauthorized') el.textContent = '请求失败: ' + e.message;
+  }
+}
+
+/* === 电源操作 === */
+async function doPower(action) {
+  let msgEl = document.getElementById('power-msg');
+  let label = action === 'reboot' ? '重启' : '关机';
+  if (!confirm('确定要' + label + '系统吗?')) return;
+  msgEl.textContent = '执行中... 系统即将' + label + '，连接会断开';
+  try {
+    let r = await apiFetch('/api/power', {
+      method: 'POST',
+      body: JSON.stringify({action: action})
+    });
+    let d = await r.json();
+    if (d.status === 'ok') {
+      msgEl.style.color = '#f59e0b';
+      msgEl.textContent = '已执行' + label + '，等待系统恢复...';
+    } else {
+      msgEl.style.color = '#ef4444';
+      msgEl.textContent = d.error || '执行失败';
+    }
+  } catch(e) {
+    msgEl.style.color = '#f59e0b';
+    msgEl.textContent = '系统已' + label + '，连接断开（正常现象）';
+  }
+}
+
 /* === 网络设置 === */
 let netLoaded = false;
 
@@ -417,7 +510,7 @@ function showTab(tab) {
   });
   document.getElementById('panel-'+tab).classList.remove('hidden');
   document.getElementById('tab-'+tab).classList.add('active');
-  if (tab === 'status') { checkStatus(); loadNetwork(); }
+  if (tab === 'status') { checkStatus(); loadNetwork(); loadSysInfo(); loadLogs(); }
   if (tab === 'scan' && !document.getElementById('scan-result').innerHTML) doScan();
 }
 
