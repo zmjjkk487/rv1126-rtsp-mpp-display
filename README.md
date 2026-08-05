@@ -1,7 +1,9 @@
-# RV1126B 嵌入式 RTSP 硬解码显示系统 + Web 管理平台
+# RV1126B 嵌入式 RTSP 硬解码显示系统 + Web 管理平台 + 摄像头生产者
 
-基于正点原子 ATK-DLRV1126B 开发板，实现 RTSP 网络摄像头拉流 → MPP 硬件解码 → RGA 硬件颜色转换 → MIPI LCD 屏幕实时显示，
-以及嵌入式 Web 管理后台（ONVIF 自动发现 + 一键连接 + HLS 预览 + 登录认证）。
+基于正点原子 ATK-DLRV1126B 开发板，实现：
+- **消费者**：RTSP 网络摄像头拉流 → MPP 硬件解码 → RGA 硬件颜色转换 → MIPI LCD 屏幕实时显示
+- **生产者**：板载 IMX415 摄像头采集 → MPP 硬件编码 → RTSP 双码流推流（板子即一台标准 ONVIF 摄像头）
+- **Web 管理后台**：ONVIF 自动发现 + 一键连接 + HLS 预览 + 登录认证
 
 ---
 
@@ -15,16 +17,23 @@ rtsp_display (GStreamer + RGA 硬解硬转, 板子屏幕显示)
     ▲
     │ config.ini  /  last_connect.json
     │
-rv1126_web (Web 管理后台, 端口 8080)
+rv1126_web (Web 管理后台, 端口 8090)
     ▲
-浏览器 (http://板子IP:8080)
+浏览器 (http://板子IP:8090)
+
+--- 生产者 (板子即摄像头) ---
+IMX415 (MIPI) → ISP (mainpath/selfpath 双通道)
+    ├─ 2688x1520 → mpph264enc → RTSP /stream0  (主码流 2K@15)
+    └─ 1920x1080 → mpph264enc → RTSP /stream1  (子码流 1080p@10)
+    └─ ONVIF: WS-Discovery 发现 + SOAP :80/onvif/device_service
 ```
 
-**两个进程**：
+**三个进程**：
 | 进程 | 功能 | 技术 |
 |------|------|------|
 | `rtsp_display` | 显示管线 | GStreamer + MPP 硬解 + RGA 硬转 + fbdev |
 | `rv1126_web` | Web 后台 | Rust (axum) + ONVIF + HLS |
+| `producer` | 摄像头生产者 (采集+编码+RTSP+ONVIF) | 纯 C + GStreamer (rtsp_server/) |
 
 ### 数据流
 
@@ -43,6 +52,46 @@ h264parse (avcC→Annex-B)       RGA (NV12→RGB + 缩放, <1ms)
 **延迟构成**: 总约 300-500ms（瓶颈在 jitterbuffer 300ms）
 
 **硬件加速**: MPP (VPU 硬解码) + RGA (2D 加速器颜色转换) → CPU < 15% @ 1080p 25fps
+
+---
+
+## 摄像头生产者 (rtsp_server/)
+
+板子把自己变成一台标准 ONVIF 摄像头，供 web 摄像头管理/ODM/任意播放器拉流。
+
+### 编译与部署
+
+```bash
+cd rtsp_server
+# 交叉编译 (工具链 /opt/atk-dlrv1126b-toolchain)
+make CC=/opt/atk-dlrv1126b-toolchain/bin/aarch64-buildroot-linux-gnu-gcc \
+     CFLAGS="--sysroot=<工具链sysroot> -O2 -std=c11 -Wall -Wextra" \
+     GST_CFLAGS="-I<SYS>/usr/include/gstreamer-1.0 -I<SYS>/usr/include/glib-2.0 -I<SYS>/usr/lib/glib-2.0/include" \
+     GST_LIBS="--sysroot=<SYS> -L<SYS>/usr/lib -lgstreamer-1.0 -lgobject-2.0 -lglib-2.0 -lgmodule-2.0 -lgstapp-1.0 -lgstvideo-1.0 -lm -ldl" \
+     producer
+
+# 板端部署运行
+scp producer root@<板子IP>:/root/
+ssh root@<板子IP> "nohup /root/producer 8554 > /tmp/producer.log 2>&1 &"
+```
+
+### 拉流地址 (海康风格)
+
+| 码流 | 地址 | 分辨率/帧率 | 码率 |
+|------|------|------------|------|
+| 主码流 | `rtsp://<板子IP>:8554/stream0` | 2688x1520 @15 | 5Mbps |
+| 子码流 | `rtsp://<板子IP>:8554/stream1` | 1920x1080 @10 | 2Mbps |
+
+- 传输: TCP interleaved; 播放器: VLC(`--rtsp-tcp`)/ffplay(`-rtsp_transport tcp`)/gst 均可
+- ONVIF: WS-Discovery 组播发现 + `http://<板子IP>/onvif/device_service` (GetProfiles/GetStreamUri 等 13+ 接口, 严格 XML)
+- 本机验证工具: `rtsp_server/file_source` (文件喂流) + `rtsp_server/measure_streams.py` (帧率回路)
+
+### 已知限制 (RV1126 芯片级)
+
+- **MPP 多会话调度不保证公平**: 双码流实测多数时间达标, 偶发一路短暂掉到 1-2fps (大厂低端芯片同样受制, 故普遍采用双码流而非三码流)
+- IMX415 定焦镜头, 无自动对焦 (模糊需物理调焦或换模组)
+- ONVIF HTTP 占用 :80 — 需停用 SDK 自带 nginx (`/etc/init.d/S50nginx`), 否则重启后冲突
+- 板载 wlan0 与 eth0 同网段会造成组播回包来源漂移 (ODM 类工具可能搜不到) — 产品上 WiFi 应换独立网段
 
 ---
 
@@ -93,6 +142,16 @@ rv1126_rtsp_mpp_demo/
 ---
 
 ## 快速开始
+
+> 注: Web 后台实际端口为 **8090** (旧文档 8080 已过时)
+
+### 0. 摄像头生产者 (板子即摄像头)
+
+```bash
+# 板端 (已部署 /root/producer 后)
+ssh root@<板子IP> "nohup /root/producer 8554 > /tmp/producer.log 2>&1 &"
+# 浏览器打开 http://<板子IP>:8090 → 摄像头管理 → 搜索 → 出现板子自己 → 连接显示
+```
 
 ### 1. 编译
 
