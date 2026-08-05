@@ -166,6 +166,15 @@ pre{background:#0a0e17;padding:10px;border-radius:8px;overflow-x:auto;font-size:
     <div id="network-msg" style="margin-top:8px;font-size:12px;color:#94a3b8"></div>
   </div>
   <div class="card">
+    <h3>&#x1F4A1; 红外控制 (IRCUT)</h3>
+    <div id="ircut-info"><span class="status status-yellow"></span> 检查中...</div>
+    <div style="margin-top:10px;display:flex;gap:8px">
+      <button class="btn btn-primary" onclick="setIrcut('day')">&#x2600;&#xFE0F; 白天 (彩色)</button>
+      <button class="btn btn-primary" onclick="setIrcut('night')">&#x1F311; 夜间 (红外)</button>
+    </div>
+    <div id="ircut-msg" style="margin-top:8px;font-size:12px;color:#94a3b8"></div>
+  </div>
+  <div class="card">
     <h3>&#x1F4F7; 摄像头网段设置</h3>
     <div id="camnet-info"><span class="status status-yellow"></span> 加载中...</div>
     <div style="margin-top:10px">
@@ -432,6 +441,34 @@ async function saveNetwork() {
   }
 }
 
+/* === 红外控制 (IRCUT) === */
+async function setIrcut(mode) {
+  let msgEl = document.getElementById('ircut-msg');
+  let label = mode === 'day' ? '白天(彩色)' : '夜间(红外)';
+  msgEl.style.color = '#94a3b8';
+  msgEl.textContent = '切换中...';
+  try {
+    let r = await apiFetch('/api/ircut', {
+      method: 'POST',
+      body: JSON.stringify({mode: mode})
+    });
+    let d = await r.json();
+    if (d.status === 'ok') {
+      msgEl.style.color = '#22c55e';
+      msgEl.textContent = '已切换: ' + label;
+      document.getElementById('ircut-info').innerHTML = '<span class="status status-green"></span> 当前: ' + label;
+    } else {
+      msgEl.style.color = '#ef4444';
+      msgEl.textContent = (d.error || '切换失败') + ' (摄像头可能不支持)';
+    }
+  } catch(e) {
+    if (e.message !== 'unauthorized') {
+      msgEl.style.color = '#ef4444';
+      msgEl.textContent = '请求失败: ' + e.message;
+    }
+  }
+}
+
 /* === 摄像头网段设置 === */
 async function loadCamNetwork() {
   try {
@@ -510,7 +547,7 @@ function showTab(tab) {
   });
   document.getElementById('panel-'+tab).classList.remove('hidden');
   document.getElementById('tab-'+tab).classList.add('active');
-  if (tab === 'status') { checkStatus(); loadNetwork(); loadSysInfo(); loadLogs(); }
+  if (tab === 'status') { checkStatus(); loadNetwork(); loadCamNetwork(); loadSysInfo(); loadLogs(); }
   if (tab === 'scan' && !document.getElementById('scan-result').innerHTML) doScan();
 }
 
