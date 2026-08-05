@@ -1132,6 +1132,44 @@ async fn handle_power(
     Json(serde_json::json!({"status":"ok","action":action})).into_response()
 }
 
+/// GET /api/time — 获取当前系统时间
+/// POST /api/time — NTP 校时 (body: {"server":"ntp.aliyun.com"} 可选)
+async fn handle_time(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    req: axum::http::Request<axum::body::Body>,
+) -> Response {
+    if !check_auth(&state, &headers).await { return unauthorized(); }
+
+    if req.method() == axum::http::Method::GET {
+        // 读当前时间
+        let out = Command::new("date").arg("+%Y-%m-%d %H:%M:%S").output().await;
+        let time_str = out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
+        return Json(serde_json::json!({"status":"ok","time":time_str})).into_response();
+    }
+
+    // POST: NTP 校时
+    let body_bytes = axum::body::to_bytes(req.into_body(), 4096).await.unwrap_or_default();
+    let server = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+        .ok()
+        .and_then(|v| v["server"].as_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| "ntp.aliyun.com".to_string());
+
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg(format!("ntpd -q -p {} >/dev/null 2>&1", server))
+        .output()
+        .await;
+
+    // 读校时后时间
+    let out = Command::new("date").arg("+%Y-%m-%d %H:%M:%S").output().await;
+    let time_str = out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    Json(serde_json::json!({"status":"ok","time":time_str,"server":server})).into_response()
+}
+
 /// GET /api/logs — 查看系统日志 (尾 N 行)
 /// query: ?file=gst|web|hls|all&lines=100
 async fn handle_logs(
@@ -1420,6 +1458,7 @@ async fn main() {
         .route("/api/system_info", get(handle_system_info))
         .route("/api/power", post(handle_power))
         .route("/api/logs", get(handle_logs))
+        .route("/api/time", get(handle_time).post(handle_time))
         .route("/api/scan", get(handle_scan))
         .route("/api/connect", post(handle_connect))
         .route("/api/status", get(handle_status))

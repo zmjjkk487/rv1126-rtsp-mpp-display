@@ -184,6 +184,14 @@ pre{background:#0a0e17;padding:10px;border-radius:8px;overflow-x:auto;font-size:
 <!-- 设置面板 (配置相关) -->
 <div id="panel-settings" class="hidden">
   <div class="card">
+    <h3>&#x1F552; 系统时间</h3>
+    <div id="time-info" style="font-size:16px;font-weight:bold;color:#e0e6ed">--:--:--</div>
+    <div style="margin-top:10px">
+      <button class="btn btn-primary" onclick="syncTime()">&#x1F501; NTP 校时</button>
+    </div>
+    <div id="time-msg" style="margin-top:8px;font-size:12px;color:#94a3b8"></div>
+  </div>
+  <div class="card">
     <h3>&#x1F4F6; 板子网络设置</h3>
     <div id="network-info"><span class="status status-yellow"></span> 加载中...</div>
     <div style="margin-top:10px">
@@ -390,6 +398,43 @@ async function doPower(action) {
   }
 }
 
+/* === 系统时间 === */
+async function loadTime() {
+  try {
+    let r = await apiFetch('/api/time');
+    let d = await r.json();
+    if (d.status === 'ok') {
+      document.getElementById('time-info').textContent = d.time || '--:--:--';
+    }
+  } catch(e) { /* 忽略 */ }
+}
+
+async function syncTime() {
+  let msgEl = document.getElementById('time-msg');
+  msgEl.style.color = '#94a3b8';
+  msgEl.textContent = '同步中... (ntp.aliyun.com)';
+  try {
+    let r = await apiFetch('/api/time', {
+      method: 'POST',
+      body: JSON.stringify({server: 'ntp.aliyun.com'})
+    });
+    let d = await r.json();
+    if (d.status === 'ok') {
+      document.getElementById('time-info').textContent = d.time || '--:--:--';
+      msgEl.style.color = '#22c55e';
+      msgEl.textContent = '同步完成: ' + (d.time || '');
+    } else {
+      msgEl.style.color = '#ef4444';
+      msgEl.textContent = d.error || '同步失败';
+    }
+  } catch(e) {
+    if (e.message !== 'unauthorized') {
+      msgEl.style.color = '#ef4444';
+      msgEl.textContent = '请求失败: ' + e.message;
+    }
+  }
+}
+
 /* === 网络设置 === */
 let netLoaded = false;
 
@@ -559,7 +604,7 @@ function showTab(tab) {
   document.getElementById('tab-'+tab).classList.add('active');
   if (tab === 'device') { loadCamNetwork(); }
   if (tab === 'system') { checkStatus(); loadSysInfo(); loadLogs(); }
-  if (tab === 'settings') { loadNetwork(); }
+  if (tab === 'settings') { loadNetwork(); loadTime(); }
   if (tab === 'scan' && !document.getElementById('scan-result').innerHTML) doScan();
 }
 
