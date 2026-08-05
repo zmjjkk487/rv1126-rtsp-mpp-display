@@ -69,7 +69,9 @@ pre{background:#0a0e17;padding:10px;border-radius:8px;overflow-x:auto;font-size:
   <button id="tab-scan" class="active" onclick="showTab('scan')">&#x1F50D; 扫描发现</button>
   <button id="tab-connect" onclick="showTab('connect')">&#x1F517; 手动连接</button>
   <button id="tab-preview" onclick="showTab('preview')">&#x1F4FA; 预览</button>
-  <button id="tab-status" onclick="showTab('status')">&#x2139;&#xFE0F; 状态</button>
+  <button id="tab-device" onclick="showTab('device')">&#x1F4F7; 设备</button>
+  <button id="tab-system" onclick="showTab('system')">&#x1F5A5;&#xFE0F; 系统</button>
+  <button id="tab-settings" onclick="showTab('settings')">&#x2699;&#xFE0F; 设置</button>
 </div>
 
 <!-- 预览面板 -->
@@ -111,8 +113,41 @@ pre{background:#0a0e17;padding:10px;border-radius:8px;overflow-x:auto;font-size:
   </div>
 </div>
 
-<!-- 状态面板 -->
-<div id="panel-status" class="hidden">
+<!-- 设备面板 (摄像头相关) -->
+<div id="panel-device" class="hidden">
+  <div class="card">
+    <h3>&#x1F4A1; 红外控制 (IRCUT)</h3>
+    <div id="ircut-info"><span class="status status-yellow"></span> 检查中...</div>
+    <div style="margin-top:10px;display:flex;gap:8px">
+      <button class="btn btn-primary" onclick="setIrcut('day')">&#x2600;&#xFE0F; 白天 (彩色)</button>
+      <button class="btn btn-primary" onclick="setIrcut('night')">&#x1F311; 夜间 (红外)</button>
+    </div>
+    <div id="ircut-msg" style="margin-top:8px;font-size:12px;color:#94a3b8"></div>
+  </div>
+  <div class="card">
+    <h3>&#x1F4F7; 摄像头网段设置</h3>
+    <div id="camnet-info"><span class="status status-yellow"></span> 加载中...</div>
+    <div style="margin-top:10px">
+      <label>摄像头连接方式</label>
+      <select id="camnet-method">
+        <option value="dhcp">DHCP (自动获取)</option>
+        <option value="static">静态 IP</option>
+      </select>
+      <label>摄像头 IP 地址</label>
+      <input id="camnet-ip" placeholder="192.168.1.200">
+      <label>子网前缀</label>
+      <input id="camnet-prefix" placeholder="24">
+    </div>
+    <div style="margin-top:12px">
+      <button class="btn btn-primary" onclick="saveCamNetwork()">&#x1F4C4; 保存摄像头网段</button>
+    </div>
+    <div id="camnet-msg" style="margin-top:8px;font-size:12px;color:#94a3b8"></div>
+    <p style="margin-top:8px;font-size:11px;color:#64748b">&#x26A0;&#xFE0F; 修改后摄像头 IP 会变化, 连接会断开, 需用新 IP 重新连接</p>
+  </div>
+</div>
+
+<!-- 系统面板 (系统相关) -->
+<div id="panel-system" class="hidden">
   <div class="card">
     <h3>&#x2139;&#xFE0F; 系统状态</h3>
     <div id="status-info"><span class="status status-yellow"></span> 检查中...</div>
@@ -144,6 +179,10 @@ pre{background:#0a0e17;padding:10px;border-radius:8px;overflow-x:auto;font-size:
     </div>
     <div id="power-msg" style="margin-top:8px;font-size:12px;color:#94a3b8"></div>
   </div>
+</div>
+
+<!-- 设置面板 (配置相关) -->
+<div id="panel-settings" class="hidden">
   <div class="card">
     <h3>&#x1F4F6; 板子网络设置</h3>
     <div id="network-info"><span class="status status-yellow"></span> 加载中...</div>
@@ -164,35 +203,6 @@ pre{background:#0a0e17;padding:10px;border-radius:8px;overflow-x:auto;font-size:
       <button class="btn btn-primary" onclick="saveNetwork()">&#x1F4C4; 保存板子网络</button>
     </div>
     <div id="network-msg" style="margin-top:8px;font-size:12px;color:#94a3b8"></div>
-  </div>
-  <div class="card">
-    <h3>&#x1F4A1; 红外控制 (IRCUT)</h3>
-    <div id="ircut-info"><span class="status status-yellow"></span> 检查中...</div>
-    <div style="margin-top:10px;display:flex;gap:8px">
-      <button class="btn btn-primary" onclick="setIrcut('day')">&#x2600;&#xFE0F; 白天 (彩色)</button>
-      <button class="btn btn-primary" onclick="setIrcut('night')">&#x1F311; 夜间 (红外)</button>
-    </div>
-    <div id="ircut-msg" style="margin-top:8px;font-size:12px;color:#94a3b8"></div>
-  </div>
-  <div class="card">
-    <h3>&#x1F4F7; 摄像头网段设置</h3>
-    <div id="camnet-info"><span class="status status-yellow"></span> 加载中...</div>
-    <div style="margin-top:10px">
-      <label>摄像头连接方式</label>
-      <select id="camnet-method">
-        <option value="dhcp">DHCP (自动获取)</option>
-        <option value="static">静态 IP</option>
-      </select>
-      <label>摄像头 IP 地址</label>
-      <input id="camnet-ip" placeholder="192.168.1.200">
-      <label>子网前缀</label>
-      <input id="camnet-prefix" placeholder="24">
-    </div>
-    <div style="margin-top:12px">
-      <button class="btn btn-primary" onclick="saveCamNetwork()">&#x1F4C4; 保存摄像头网段</button>
-    </div>
-    <div id="camnet-msg" style="margin-top:8px;font-size:12px;color:#94a3b8"></div>
-    <p style="margin-top:8px;font-size:11px;color:#64748b">&#x26A0;&#xFE0F; 修改后摄像头 IP 会变化, 连接会断开, 需用新 IP 重新连接</p>
   </div>
   <div class="card">
     <h3>&#x1F511; 修改密码</h3>
@@ -541,13 +551,15 @@ function doLogout() {
 
 /* === 标签切换 === */
 function showTab(tab) {
-  ['scan','connect','preview','status'].forEach(t => {
+  ['scan','connect','preview','device','system','settings'].forEach(t => {
     document.getElementById('panel-'+t).classList.add('hidden');
     document.getElementById('tab-'+t).classList.remove('active');
   });
   document.getElementById('panel-'+tab).classList.remove('hidden');
   document.getElementById('tab-'+tab).classList.add('active');
-  if (tab === 'status') { checkStatus(); loadNetwork(); loadCamNetwork(); loadSysInfo(); loadLogs(); }
+  if (tab === 'device') { loadCamNetwork(); }
+  if (tab === 'system') { checkStatus(); loadSysInfo(); loadLogs(); }
+  if (tab === 'settings') { loadNetwork(); }
   if (tab === 'scan' && !document.getElementById('scan-result').innerHTML) doScan();
 }
 
