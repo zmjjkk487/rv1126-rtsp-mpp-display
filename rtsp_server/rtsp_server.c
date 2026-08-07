@@ -466,6 +466,14 @@ static int handle_request(rtsp_session *s, const char *req) {
         return rc;
     }
     if (strcmp(method, "PLAY") == 0) {
+        /* 状态机校验 (RFC 2326 §13): 没 SETUP(READY) 就 PLAY 是非法迁移,
+         * 显式拒绝, 而不是默默接受后收不到数据 (曾经的缺陷) */
+        int st = atomic_load(&s->state);
+        if (st != ST_READY && st != ST_PLAYING) {
+            printf("[RTSP] 非法状态迁移: PLAY 但 state=%d → 455\n", st);
+            return rtsp_reply(s, cseq, "455 Method Not Valid in This State",
+                              NULL, NULL);
+        }
         char extra[384];
         snprintf(extra, sizeof extra,
                  "Session: %s\r\n"

@@ -78,10 +78,13 @@ pre{background:#0a0e17;padding:10px;border-radius:8px;overflow-x:auto;font-size:
 <div id="panel-preview" class="hidden">
   <div class="card">
     <h3>&#x1F4FA; 视频预览</h3>
-    <p class="meta">浏览器实时预览 (GStreamer hlssink2 转 HLS, 约 3-5 秒延迟)</p>
+    <p class="meta">HLS 预览约 2-3 秒延迟; 低延迟预览 (MJPEG) 约 100-300ms</p>
+    <img id="mjpeg-preview"
+         style="display:none;width:100%;background:#000;border-radius:8px;margin-top:10px">
     <video id="preview-video" controls autoplay muted playsinline
            style="width:100%;background:#000;border-radius:8px;margin-top:10px"></video>
     <div style="margin-top:10px">
+      <button class="btn btn-primary" onclick="togglePreviewMode()">&#9889; 低延迟预览</button>
       <button class="btn btn-danger" onclick="stopPreview()">&#9632; 停止预览</button>
     </div>
   </div>
@@ -608,6 +611,30 @@ function showTab(tab) {
   if (tab === 'scan' && !document.getElementById('scan-result').innerHTML) doScan();
 }
 
+/* === 预览: HLS / MJPEG 低延迟切换 === */
+let previewMJPEG = false;
+
+/* MJPEG 流在 producer 的 :80 (ONVIF HTTP 服务), 绕过 web_rust 直连 */
+function mjpegUrl() {
+  return 'http://' + window.location.hostname + ':80/preview';
+}
+
+function togglePreviewMode() {
+  previewMJPEG = !previewMJPEG;
+  let img = document.getElementById('mjpeg-preview');
+  let vid = document.getElementById('preview-video');
+  if (previewMJPEG) {
+    img.src = mjpegUrl();
+    img.style.display = '';
+    vid.style.display = 'none';
+    if (hlsPlayer) { hlsPlayer.destroy(); hlsPlayer = null; }
+  } else {
+    img.src = '';
+    img.style.display = 'none';
+    vid.style.display = '';
+  }
+}
+
 /* === HLS 预览 === */
 let hlsPlayer = null;
 function startPreview(rtspUrl) {
@@ -630,8 +657,9 @@ function startPreview(rtspUrl) {
       if (window.Hls && window.Hls.isSupported()) {
         hlsPlayer = new Hls({
           liveDurationInfinity: true,
-          liveSyncDurationCount: 3,
-          maxBufferLength: 10
+          liveSyncDurationCount: 1,
+          lowLatencyMode: true,
+          maxBufferLength: 3
         });
         hlsPlayer.loadSource(hlsUrl);
         hlsPlayer.attachMedia(video);
@@ -670,6 +698,9 @@ function stopPreview() {
   if (hlsPlayer) { hlsPlayer.destroy(); hlsPlayer = null; }
   let video = document.getElementById('preview-video');
   video.pause(); video.src = ''; video.load();
+  let img = document.getElementById('mjpeg-preview');
+  img.src = ''; img.style.display = 'none';
+  previewMJPEG = false;
   apiFetch('/api/hls_stop', {method: 'POST'}).catch(()=>{});
 }
 

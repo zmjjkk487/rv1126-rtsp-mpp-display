@@ -43,6 +43,8 @@ struct onvif_server {
     onvif_profile_t profiles[8];   /* 码流列表 (字符串借用调用方的静态区) */
     int profile_count;
     char ircut[8];          /* 当前 IRCUT 模式 (仅状态, 未控硬件) */
+    jpeg_provider_fn jpeg_fn;      /* MJPEG 预览帧提供者 */
+    void *jpeg_ctx;
     pthread_t ws_tid, http_tid;
 };
 
@@ -538,6 +540,61 @@ static void hdr_set_network(onvif_server_t *o, const char *req, char *out, size_
     snprintf(out, cap, "<tds:SetNetworkInterfacesResponse/>\n");
 }
 
+/* ---------------- MJPEG 低延迟预览 (GET /preview) ---------------- */
+
+/* 单调时钟微秒 (onvif.c 无 glib 依赖, 不能用 g_get_monotonic_time —
+ * 隐式声明会 32 位截断成负数) */
+static int64_t mono_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+typedef struct { onvif_server_t *o; int fd; } preview_arg_t;
+
+static void *preview_thread(void *arg) {
+    preview_arg_t *pa = arg;
+    onvif_server_t *o = pa->o;
+    int fd = pa->fd;
+    free(pa);
+
+    /* multipart/x-mixed-replace: 浏览器 <img src="/preview"> 直接显示 */
+    const char *hdr =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
+        "Cache-Control: no-cache\r\n"
+        "Connection: close\r\n\r\n";
+    if (send(fd, hdr, strlen(hdr), MSG_NOSIGNAL) < 0) {
+        close(fd);
+        return NULL;
+    }
+
+    long nframe = 0;
+    for (;;) {
+        jpeg_frame_t f;
+        if (o->jpeg_fn && o->jpeg_fn(o->jpeg_ctx, &f) == 0 && f.len > 0) {
+            char part[128];
+            int n = snprintf(part, sizeof part,
+                "--frame\r\nContent-Type: image/jpeg\r\n"
+                "Content-Length: %zu\r\n\r\n", f.len);
+            if (send(fd, part, n, MSG_NOSIGNAL) < 0) break;
+            if (send(fd, f.data, f.len, MSG_NOSIGNAL) < 0) break;
+            if (send(fd, "\r\n", 2, MSG_NOSIGNAL) < 0) break;
+            if (++nframe == 1 || nframe % 50 == 0) {   /* 调试: 首帧+每50帧 */
+                printf("[preview] 帧延迟 %lld ms (f.ts=%lld, now=%lld)\n",
+                       (long long)(mono_us() - f.ts) / 1000,
+                       (long long)f.ts,
+                       (long long)mono_us());
+            }
+            usleep(100000);   /* 节流: 最高 10fps, 否则旧帧会被狂发 */
+        } else {
+            usleep(10000);   /* 无帧等 10ms */
+        }
+    }
+    close(fd);
+    return NULL;
+}
+
 /* ---------------- HTTP :80 SOAP 分发 ---------------- */
 
 static void dispatch(onvif_server_t *o, const char *body, char *resp, size_t cap) {
@@ -693,6 +750,24 @@ static void *http_thread(void *arg) {
         }
         if (!got_hdr) { close(cfd); continue; }
 
+        /* MJPEG 低延迟预览: GET /preview → 独立线程长连接推流,
+         * 不占用 ONVIF HTTP 单线程服务 */
+        if (strncmp(hdr, "GET /preview", 12) == 0) {
+            struct timeval stv = { .tv_sec = 5, .tv_usec = 0 };
+            setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &stv, sizeof stv);
+            preview_arg_t *pa = malloc(sizeof *pa);
+            if (pa) {
+                pa->o = o;
+                pa->fd = cfd;
+                pthread_t pt;
+                pthread_create(&pt, NULL, preview_thread, pa);
+                pthread_detach(pt);
+                continue;
+            }
+            close(cfd);
+            continue;
+        }
+
         /* Content-Length (上限 8191, 保证 body[clen] 定界不越界;
          * 头名大小写不敏感 — reqwest 发小写) */
         long clen = 0;
@@ -839,6 +914,13 @@ void onvif_set_profiles(onvif_server_t *o, const onvif_profile_t *profiles,
     for (int i = 0; i < count; i++)
         o->profiles[i] = profiles[i];   /* 借用调用方字符串 (静态区) */
     o->profile_count = count;
+}
+
+void onvif_set_jpeg_provider(onvif_server_t *o, jpeg_provider_fn fn,
+                             void *ctx) {
+    if (!o) return;
+    o->jpeg_fn = fn;
+    o->jpeg_ctx = ctx;
 }
 
 int onvif_start(onvif_server_t *o) {

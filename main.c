@@ -144,6 +144,13 @@ static void on_pad_added(GstElement *src, GstPad *pad, gpointer data) {
             gst_caps_unref(caps);
             return;
         }
+        /* 只链接 H264 视频: 音频轨也是 application/x-rtp,
+         * 不按 encoding-name 过滤会把音频硬链到 rtph264depay 上失败 */
+        const char *encoding = gst_structure_get_string(s, "encoding-name");
+        if (!encoding || g_ascii_strcasecmp(encoding, "H264") != 0) {
+            gst_caps_unref(caps);
+            return;
+        }
     }
     gst_caps_unref(caps);
 
@@ -279,7 +286,8 @@ static GstElement *build_pipeline(const config_t *cfg) {
         LOGE("缺少 rtspsrc");
         return NULL;
     }
-    g_object_set(G_OBJECT(rtspsrc), "location", cfg->rtsp_url, "latency", 300,
+    /* latency: 局域网 100ms 足够吸收抖动, 300ms 会让实时性差 (总延迟 ~400ms) */
+    g_object_set(G_OBJECT(rtspsrc), "location", cfg->rtsp_url, "latency", 100,
                  "drop-on-latency", TRUE, "protocols", 4, NULL);
 
     /* 2 — 4. depay → parse → h264decode */

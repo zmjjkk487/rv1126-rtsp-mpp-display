@@ -1,9 +1,39 @@
-# RV1126B 嵌入式 RTSP 硬解码显示系统 + Web 管理平台 + 摄像头生产者
+# RV1126 IP Camera · 嵌入式网络摄像头完整原型
 
 基于正点原子 ATK-DLRV1126B 开发板，实现：
 - **消费者**：RTSP 网络摄像头拉流 → MPP 硬件解码 → RGA 硬件颜色转换 → MIPI LCD 屏幕实时显示
 - **生产者**：板载 IMX415 摄像头采集 → MPP 硬件编码 → RTSP 双码流推流（板子即一台标准 ONVIF 摄像头）
 - **Web 管理后台**：ONVIF 自动发现 + 一键连接 + HLS 预览 + 登录认证
+
+RTSP 服务器、RTP 分包、ONVIF 协议栈**全部从零手写**（不依赖 gSOAP / live555 / gst-rtsp-server）。
+
+---
+
+## 🎯 这个项目能让你学到什么
+
+| 主题 | 在这里能看到 |
+|------|-------------|
+| 嵌入式 Linux | Buildroot 环境、交叉编译、fbdev 直写显示、nohup 部署 |
+| GStreamer | 拉流/推流双管线、appsink/appsrc 回调、MPP 硬解硬编 |
+| 硬件加速 | MPP (VPU) 硬解码+硬编码、RGA 2D 加速、ISP 双通道缩放 |
+| RTSP/RTP 协议 | 从零手写 RTSP 状态机、RTP 分包 (FU-A)、SDP、TCP interleaved |
+| ONVIF 协议 | WS-Discovery 发现 + SOAP 服务端（13+ 接口，严格 XML） |
+| 系统编程 | 多线程/锁/原子变量、非阻塞 IO、慢客户端丢帧策略 |
+
+**适合谁**：想完整走一遍"嵌入式摄像头"全流程的人 —— 学生、转行者、刚入职的嵌入式工程师。
+
+**为什么从零写协议**：用现成库 30 行就能起服务，但协议从此是黑盒；手写一遍，RTSP/ONVIF 从此是"一页纸 + 两端代码"。
+
+---
+
+## ✨ 特性
+
+- 🖥️ **RTSP 拉流硬解显示**：rtspsrc → mppvideodec → RGA → fbdev，CPU < 15%，断线自动重连
+- 📷 **板子即摄像头**：IMX415 → mpph264enc 硬件编码 → RTSP 双码流（主码流 2K / 子码流 1080p）
+- 🔌 **自研 RTSP 服务器**：多挂载点、TCP interleaved、FU-A 分包、慢客户端丢帧不阻塞
+- 🌐 **自研 ONVIF 应答端**：WS-Discovery 组播发现 + SOAP 服务 13+ 接口，通过 ODM 严格 XML 校验
+- 🎛️ **Web 管理平台**（Rust/axum）：ONVIF 自动发现摄像头、一键连接上屏、浏览器 HLS 预览、登录认证
+- 📊 **真机验证**：全部功能在 ATK-DLRV1126B 实板跑通，含帧率测量脚本（measure_streams.py）
 
 ---
 
@@ -90,7 +120,7 @@ ssh root@<板子IP> "nohup /root/producer 8554 > /tmp/producer.log 2>&1 &"
 
 - **MPP 多会话调度不保证公平**: 双码流实测多数时间达标, 偶发一路短暂掉到 1-2fps (大厂低端芯片同样受制, 故普遍采用双码流而非三码流)
 - IMX415 定焦镜头, 无自动对焦 (模糊需物理调焦或换模组)
-- ONVIF HTTP 占用 :80 — 需停用 SDK 自带 nginx (`/etc/init.d/S50nginx`), 否则重启后冲突
+- ONVIF HTTP 占用 :80 — SDK 自带 nginx 开机自启会抢占该端口, 本仓库已禁用 (`S50nginx` 改名 `.disabled`)
 - 板载 wlan0 与 eth0 同网段会造成组播回包来源漂移 (ODM 类工具可能搜不到) — 产品上 WiFi 应换独立网段
 
 ---
@@ -273,6 +303,7 @@ http://<板子IP>:8080
 | 屏幕黑屏但进程在跑 | weston 退出关了背光 | `echo 0 > /sys/class/backlight/backlight/bl_power` |
 | 黑屏 + 视频没写屏 | 管线没连上摄像头 | 看 `/tmp/gst_web.log` |
 | 管线断线 | 摄像头重启/断网 | 自动重连 (2s→30s 退避), 不用管 |
+| **web 搜到设备但码流列表消失** | nginx 开机自启抢占了 :80 (ONVIF HTTP 端口) | `pkill nginx` + 重启 producer; 根治: 已禁用 S50nginx 自启 |
 | 子码流变形 | 704×576 需 4:3 显示 | 已内置 PAL SAR 校正, 无需操作 |
 | 重启后不自动恢复 | last_connect.json 损坏 | Web 重新连接一次 |
 | HLS 预览报错 | 分片问题 | 前端自动重试; 检查 `/tmp/hls.log` |

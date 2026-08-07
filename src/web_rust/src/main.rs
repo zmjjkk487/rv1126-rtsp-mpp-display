@@ -23,6 +23,7 @@ use tokio::sync::Mutex;
 const STATIC_DIR: &str = "/root/camera-web/static";
 const PASSWD_FILE: &str = "/root/camera-web/passwd";
 const CREDS_FILE: &str = "/root/camera-web/creds";
+const DEVICES_FILE: &str = "/root/camera-web/devices.json";
 const DEFAULT_HASH: &str =
     "240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9";
 
@@ -32,6 +33,25 @@ struct AppState {
     pw_hash: Mutex<String>,
     sessions: Mutex<HashMap<String, u64>>,   // token → expiry timestamp
     login_fails: Mutex<Vec<u64>>,
+    devices: Mutex<Vec<DeviceEntry>>,        // 已保存摄像头列表
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct DeviceEntry {
+    id: String,
+    name: String,
+    ip: String,
+    rtsp_url: String,
+    user: String,
+    pass: String,
+    added_at: String,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct DeviceStatus {
+    #[serde(flatten)]
+    device: DeviceEntry,
+    online: bool,
 }
 
 // ─── JSON Types ─────────────────────────────────────────────
@@ -613,11 +633,11 @@ async fn hls_start(url: &str) -> (String, String) {
         .await;
 
     let cmd = format!(
-        "gst-launch-1.0 rtspsrc location='{}' latency=300 \
+        "gst-launch-1.0 rtspsrc location='{}' latency=100 \
          ! rtph264depay ! h264parse \
          ! hlssink2 location='/root/hls/seg_%05d.ts' \
          playlist-location='/root/hls/stream.m3u8' \
-         target-duration=2 max-files=30 playlist-length=0 \
+         target-duration=1 max-files=30 playlist-length=4 \
          </dev/null >/tmp/hls.log 2>&1 &",
         safe_url
     );
@@ -1443,6 +1463,7 @@ async fn main() {
         pw_hash: Mutex::new(pw_hash),
         sessions: Mutex::new(HashMap::new()),
         login_fails: Mutex::new(Vec::new()),
+        devices: Mutex::new(Vec::new()),
     });
 
     // Auto-recover last camera

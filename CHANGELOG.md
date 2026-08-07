@@ -20,6 +20,10 @@
   VLC/ffplay/gst 拉流均可
 
 ### 修复 (真机验证暴露)
+- **web 搜到设备但码流列表消失**: SDK nginx 开机自启抢占 :80, producer 的
+  ONVIF HTTP 服务 bind 失败 (WS-Discovery 独立线程仍存活 → 设备可见但
+  GetProfiles 打到 nginx 返回 404 → 码流列表为空)。已停 nginx 并禁用
+  S50nginx 开机自启 (改名 .disabled), 重启不再复发
 - **mpph264enc 属性名是 `bps` 不是 `bitrate`** — 进程内 gst_parse_launch 只警告不报错,
   CLI 才报错, 导致 feed 静默死亡
 - **HTTP 头大小写**: reqwest/hyper 发小写 `content-length:`, ONVIF 解析需大小写不敏感
