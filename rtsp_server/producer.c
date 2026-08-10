@@ -9,8 +9,10 @@
  *            → mpph264enc → /stream2                      (480p, 1Mbps, LCD 用)
  *
  * MPP 预算 (编码+解码共用, 实测 ≈127M 像素/秒):
- *   2K@15 (61M) + 1080p@20 (41M) + 480p@30 编码 (10.5M)
- *   + 显示解码 480p@30 (10.5M) = 123M ✓ 稳定
+ *   主线禁用时: 1080p@15 (31M) + 480p@30 编码 (10.5M)
+ *   + 显示解码 海康 D1@25 (10M) + 预览转码 解码+JPEG (20M) ≈ 72M ✓
+ *   注意: 总吞吐低于预算但并发仍可能饿死 H264 编码器 (h264e_dpb
+ *   看门狗崩溃) — 1080p 编码从 20fps 降到 15fps 留调度余量 (实测验证)
  *   1080p 单路 60fps 需 124M, 超出预算 → 不可行;
  *   480p 单路 60fps 仅 21M → 可行, 但会挤占主码流/1080p 的预算。
  *
@@ -318,14 +320,15 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* 三码流参数 (预算内: 1080p@20 + 720p@30 + LCD = 101M < 127M) */
+    /* 三码流参数 (1080p@15: 降帧率给 MPP 编码器留调度余量,
+     * 三合一并发 (producer+显示+预览) 下 20fps 会饿死 rkvenc2) */
     g_st[ST_MAIN].device = "/dev/video-camera0";
     g_st[ST_MAIN].w = 2688; g_st[ST_MAIN].h = 1520;
     g_st[ST_MAIN].bps = 5000000; g_st[ST_MAIN].fps = 15;
 
     g_st[ST_1080].device = "/dev/video32";
     g_st[ST_1080].w = 1920; g_st[ST_1080].h = 1080;
-    g_st[ST_1080].bps = 2000000; g_st[ST_1080].fps = 20;
+    g_st[ST_1080].bps = 2000000; g_st[ST_1080].fps = 15;
     g_st[ST_1080].raw_sink = (GstAppSink *)1;   /* 标记: 构建时创建 rawsink */
 
     g_st[ST_480].device = NULL;              /* 1080p 帧 CPU 缩放 */
