@@ -959,6 +959,7 @@ async fn handle_logout(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
 ) -> Response {
+    if !check_auth(&state, &headers).await { return unauthorized(); }
     if let Some(auth) = headers.get(header::AUTHORIZATION) {
         if let Ok(val) = auth.to_str() {
             if let Some(tok) = val.strip_prefix("Bearer ") {
@@ -1047,7 +1048,11 @@ async fn handle_hls_start(
     (StatusCode::OK, Json(serde_json::json!({"status":"ok","hls_token":tok}))).into_response()
 }
 
-async fn handle_hls_stop() -> Response {
+async fn handle_hls_stop(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if !check_auth(&state, &headers).await { return unauthorized(); }
     let _ = Command::new("killall").args(["-9", "gst-launch-1.0"]).output().await;
     let _ = std::fs::remove_file("/tmp/hls_token");
     // 停止预览后清理分片缓存 (避免残留最多 30 个 ts 文件)
@@ -1070,7 +1075,8 @@ static PREVIEW_TX: std::sync::Mutex<
 > = std::sync::Mutex::new(None);
 
 /// POST /api/preview_start — 启动低延迟预览 (body: {"url":"rtsp://..."})
-/// gst-launch 拉流 → 硬解 → 缩到 640x360 → mppjpegenc → JPEG 帧流
+/// 成功返回 preview_token: /preview 流需带 ?t=<token> 鉴权
+/// gst-launch 拉流 → 硬解 → mppjpegenc → JPEG 帧流
 async fn handle_preview_start(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -1116,6 +1122,10 @@ async fn handle_preview_start(
     let stdout = child.stdout.take().expect("stdout piped");
     *PREVIEW_CHILD.lock().unwrap() = Some(child);
 
+    /* 预览 token: <img> 带不了 Authorization 头, /preview 走 ?t= 鉴权 (同 HLS 机制) */
+    let pv_tok = gen_token();
+    let _ = tokio::fs::write("/tmp/preview_token", &pv_tok).await;
+
     let (tx, _) = tokio::sync::broadcast::channel::<Vec<u8>>(8);
     *PREVIEW_TX.lock().unwrap() = Some(tx.clone());
 
@@ -1156,11 +1166,16 @@ async fn handle_preview_start(
         }
     });
 
-    (StatusCode::OK, Json(serde_json::json!({"status":"ok"}))).into_response()
+    (StatusCode::OK, Json(serde_json::json!({"status":"ok","preview_token":pv_tok}))).into_response()
 }
 
 /// GET /preview — 浏览器低延迟预览 (multipart/x-mixed-replace 流)
-async fn handle_preview() -> Response {
+/// 鉴权: ?t=<token> 必须匹配 /tmp/preview_token (与 HLS 同机制)
+async fn handle_preview(raw_query: axum::extract::RawQuery) -> Response {
+    let params = parse_query(raw_query.0.as_deref());
+    if !check_preview_token(&params).await {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
     let tx = PREVIEW_TX.lock().unwrap().clone();
     let Some(tx) = tx else {
         return (StatusCode::NOT_FOUND, "preview not started").into_response();
@@ -1187,13 +1202,18 @@ async fn handle_preview() -> Response {
         .unwrap()
 }
 
-/// POST /api/preview_stop — 停止低延迟预览
-async fn handle_preview_stop() -> Response {
+/// POST /api/preview_stop — 停止低延迟预览 (需登录)
+async fn handle_preview_stop(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if !check_auth(&state, &headers).await { return unauthorized(); }
     if let Some(mut c) = PREVIEW_CHILD.lock().unwrap().take() {
         let _ = c.kill();
         let _ = c.wait();
     }
     *PREVIEW_TX.lock().unwrap() = None;
+    let _ = std::fs::remove_file("/tmp/preview_token");
     Json(serde_json::json!({"status":"ok"})).into_response()
 }
 
@@ -1439,6 +1459,16 @@ async fn handle_camera_network_set(
 async fn check_hls_token(params: &HashMap<String, String>) -> bool {
     if let Some(tok) = params.get("t") {
         if let Ok(stored) = tokio::fs::read_to_string("/tmp/hls_token").await {
+            return stored.trim() == tok.trim();
+        }
+    }
+    false
+}
+
+/// MJPEG 预览流 token 校验 (与 HLS 同机制, 独立文件 /tmp/preview_token)
+async fn check_preview_token(params: &HashMap<String, String>) -> bool {
+    if let Some(tok) = params.get("t") {
+        if let Ok(stored) = tokio::fs::read_to_string("/tmp/preview_token").await {
             return stored.trim() == tok.trim();
         }
     }

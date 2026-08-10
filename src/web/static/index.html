@@ -634,10 +634,12 @@ function togglePreviewMode() {
       apiFetch('/api/preview_start', {
         method: 'POST',
         body: JSON.stringify({url: lastPreviewUrl})
+      }).then(r => r.json()).then(d => {
+        if (d.preview_token) {
+          /* /preview 需要 ?t=<token> 鉴权 (img 标签带不了 Authorization 头) */
+          img.src = mjpegUrl() + '?t=' + d.preview_token;
+        }
       }).catch(()=>{});
-      setTimeout(() => {
-        img.src = mjpegUrl() + '?t=' + Date.now();
-      }, 300);
     }
     img.style.display = '';
     vid.style.display = 'none';
