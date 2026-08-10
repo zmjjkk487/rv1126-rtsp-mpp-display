@@ -755,7 +755,8 @@ async function doScan() {
     }
     let html = '<p style="margin-top:12px">发现 <b>'+d.count+'</b> 台设备:</p>';
     window.devices = d.devices;
-    d.devices.forEach((dev,i) => {
+    scanDevices = d.devices;   /* 快照: 按钮只存索引, 恶意数据不进 HTML 属性 */
+  d.devices.forEach((dev,i) => {
       let profHTML = '';
       if (dev.profiles && dev.profiles.length > 0) {
         profHTML += '<div style="margin:8px 0 4px">'+
@@ -763,22 +764,22 @@ async function doScan() {
           '<input id="cred-user-'+i+'" value="admin" placeholder="账号" style="flex:1;font-size:12px">'+
           '<input id="cred-pass-'+i+'" value="" placeholder="密码" type="password" style="flex:1;font-size:12px">'+
           '</div></div>';
-        dev.profiles.forEach(p => {
-          let label = p.name || p.token;
+        dev.profiles.forEach((p, j) => {
+          let label = esc(p.name || p.token);
           if (p.width) label += ' ('+p.width+'x'+p.height+')';
           profHTML += '<div style="margin:4px 0">'+
             '<span style="font-size:12px">'+label+'</span><br>'+
-            (p.uri ? '<input value="'+p.uri+'" readonly style="width:100%;font-size:11px;margin:2px 0" onclick="this.select()">' : '')+
+            (p.uri ? '<input value="'+esc(p.uri)+'" readonly style="width:100%;font-size:11px;margin:2px 0" onclick="this.select()">' : '')+
             '<button class="btn btn-primary" style="font-size:11px;padding:4px 12px" onclick="doConnectWithCreds('+
-            i+',\''+(p.uri||'')+'\')">&#x25B6; '+
+            i+','+j+')">&#x25B6; '+
             ((p.name||'').toLowerCase().indexOf('sub')>=0 ? '子码流' : '主码流')+'</button>'+
-            '<button class="btn" style="font-size:11px;padding:4px 12px;background:#1d4ed8;color:#fff;border:none;border-radius:6px;margin-left:6px;cursor:pointer" onclick="startPreview(\''+(p.uri||'')+'\')">&#x1F4FA; 预览</button>'+
+            '<button class="btn" style="font-size:11px;padding:4px 12px;background:#1d4ed8;color:#fff;border:none;border-radius:6px;margin-left:6px;cursor:pointer" onclick="startPreviewAt('+i+','+j+')">&#x1F4FA; 预览</button>'+
             '</div>';
         });
       }
       html += '<div class="card">'+
-        '<h3>&#x1F4F7; '+dev.name+'</h3>'+
-        '<div class="meta">IP: '+dev.ip+' | 服务: '+dev.xaddrs+'</div>'+
+        '<h3>&#x1F4F7; '+esc(dev.name)+'</h3>'+
+        '<div class="meta">IP: '+esc(dev.ip)+' | 服务: '+esc(dev.xaddrs)+'</div>'+
         profHTML+
         '</div>';
     });
@@ -789,10 +790,27 @@ async function doScan() {
   }
 }
 
-function doConnectWithCreds(devIndex, url) {
+/* 扫描结果快照 + 转义: 按钮只存索引, 恶意设备名/URI 永不进 HTML 属性 (扫1 #3) */
+let scanDevices = null;
+
+/* HTML 文本/属性转义 (ONVIF 元数据来自网络, 不可信) */
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function startPreviewAt(di, pj) {
+  let p = scanDevices && scanDevices[di] && scanDevices[di].profiles[pj];
+  if (p && p.uri) startPreview(p.uri);
+}
+
+function doConnectWithCreds(devIndex, profIndex) {
+  if (!scanDevices || !scanDevices[devIndex]) return;
   let u = document.getElementById('cred-user-'+devIndex).value;
   let p = document.getElementById('cred-pass-'+devIndex).value;
-  doConnect(url, u, p);
+  let prof = scanDevices[devIndex].profiles[profIndex];
+  doConnect(prof ? (prof.uri || '') : '', u, p);
 }
 
 async function doConnect(url, user, pass) {

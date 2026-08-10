@@ -684,8 +684,9 @@ fn hls_playlist(token: &str) -> String {
 // ─── Pipeline Control ───────────────────────────────────────
 
 async fn pipeline_connect(base_url: &str, user: &str, pass: &str) -> Option<String> {
-    // Save credentials
+    // Save credentials — 显式 0600, 防同机其他用户读取 (扫1 #21)
     let _ = fs::write(CREDS_FILE, format!("{}:{}\n", user, pass)).await;
+    let _ = Command::new("chmod").args(["600", CREDS_FILE]).output().await;
 
     // Save config.ini
     let cfg = format!(
@@ -770,7 +771,11 @@ async fn check_auth(state: &AppState, headers: &axum::http::HeaderMap) -> bool {
         if let Ok(val) = auth.to_str() {
             if let Some(token) = val.strip_prefix("Bearer ") {
                 let sessions = state.sessions.lock().await;
-                return sessions.contains_key(token);
+                /* 过期检查: 登录时存入的 expiry 超时即失效 (扫1 #19) */
+                return match sessions.get(token) {
+                    Some(&exp) => now_secs() < exp,
+                    None => false,
+                };
             }
         }
     }
@@ -1013,6 +1018,10 @@ async fn handle_connect(
     let url = body["url"].as_str().unwrap_or("").to_string();
     if url.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"missing url"}))).into_response();
+    }
+    /* 防 config.ini 注入 (扫2 #9): URL 带换行/控制字符直接拒绝 */
+    if url.contains('\n') || url.contains('\r') || url.contains('\0') {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"invalid url"}))).into_response();
     }
 
     // JSON 里的 user/pass 优先, 否则从 URL 提取

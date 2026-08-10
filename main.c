@@ -262,6 +262,21 @@ static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer data) {
     return GST_FLOW_OK;
 }
 
+/* 日志脱敏: URL 里的 user:pass@ 以 *** 替代 (凭据永不进日志, 扫1 #20) */
+static void log_redacted_url(const config_t *cfg) {
+    char safe[MAX_PATH];
+    const char *at = strstr(cfg->rtsp_url, "@");
+    const char *proto = strstr(cfg->rtsp_url, "://");
+    if (at && proto && at > proto + 3) {
+        size_t n = (size_t)(proto - cfg->rtsp_url) + 3;
+        snprintf(safe, sizeof safe, "%.*s***@%s",
+                 (int)n, cfg->rtsp_url, at + 1);
+        LOGI("RTSP: %s", safe);
+    } else {
+        LOGI("RTSP: %s", cfg->rtsp_url);
+    }
+}
+
 /* 信号处理 */
 static void on_signal(int sig) {
     (void)sig;
@@ -370,7 +385,7 @@ int main(int argc, char *argv[]) {
     LOGI("========================================");
     LOGI("RV1126 GStreamer RTSP 解码显示 Demo");
     LOGI("========================================");
-    LOGI("RTSP: %s", g_cfg.rtsp_url);
+    log_redacted_url(&g_cfg);
     LOGI("管道: rtspsrc → depay → parse → mppvideodec → appsink(NV12) → RGA → fbdev");
 
     /* 初始化 GStreamer */
