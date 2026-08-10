@@ -1102,6 +1102,10 @@ async fn handle_preview_start(
         return (StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error":"missing url"}))).into_response();
     }
+    /* ONVIF GetStreamUri 返回的 URI 带 XML 转义 (&amp; → &), 必须还原:
+     * 不还原 rtspsrc 会把 &amp; 当查询参数发给摄像头 → 401 → 预览打不开
+     * (hls_start 的 inject_creds 已处理, 此处曾遗漏) */
+    let url = xml_unescape(&url);
 
     // 停旧的
     if let Some(mut old) = PREVIEW_CHILD.lock().unwrap().take() {

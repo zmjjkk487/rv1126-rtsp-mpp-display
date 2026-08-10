@@ -626,6 +626,15 @@ function mjpegUrl() {
   return window.location.origin + '/preview';
 }
 
+/* 停止低延迟预览并清空 img (切流/关闭时防残留上一路画面) */
+function stopMjpegPreview() {
+  let img = document.getElementById('mjpeg-preview');
+  img.src = '';
+  img.style.display = 'none';
+  previewMJPEG = false;
+  apiFetch('/api/preview_stop', {method: 'POST'}).catch(()=>{});
+}
+
 function togglePreviewMode() {
   previewMJPEG = !previewMJPEG;
   let img = document.getElementById('mjpeg-preview');
@@ -651,10 +660,9 @@ function togglePreviewMode() {
     vid.style.display = 'none';
     if (hlsPlayer) { hlsPlayer.destroy(); hlsPlayer = null; }
   } else {
-    img.src = '';
-    img.style.display = 'none';
-    vid.style.display = '';
-    apiFetch('/api/preview_stop', {method: 'POST'}).catch(()=>{});
+    /* 关闭低延迟: 清 img 停代理, 恢复 HLS 元素 */
+    stopMjpegPreview();
+    document.getElementById('preview-video').style.display = '';
   }
 }
 
@@ -662,6 +670,9 @@ function togglePreviewMode() {
 let hlsPlayer = null;
 function startPreview(rtspUrl) {
   if (!rtspUrl) { alert('该码流无 RTSP 地址'); return; }
+  /* 切换码流: 先停低延迟预览 — 否则 img 残留上一路画面,
+   * 且 hls_start 的 killall 会杀掉转码代理导致画面冻结 */
+  stopMjpegPreview();
   lastPreviewUrl = rtspUrl;
   showTab('preview');
   document.getElementById('preview-video').src = '';
