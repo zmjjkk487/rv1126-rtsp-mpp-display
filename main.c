@@ -271,10 +271,22 @@ static void log_redacted_url(const config_t *cfg) {
         size_t n = (size_t)(proto - cfg->rtsp_url) + 3;
         snprintf(safe, sizeof safe, "%.*s***@%s",
                  (int)n, cfg->rtsp_url, at + 1);
-        LOGI("RTSP: %s", safe);
     } else {
-        LOGI("RTSP: %s", cfg->rtsp_url);
+        snprintf(safe, sizeof safe, "%s", cfg->rtsp_url);
     }
+    /* query 串里的 username=/password= 值也脱敏 (海康 GetStreamUri 带凭据) */
+    char *q = strchr(safe, '?');
+    while (q) {
+        char *key = strstr(q, "username=");
+        if (!key) key = strstr(q, "password=");
+        if (!key) break;
+        char *val = key + 9;              /* 值起点 */
+        char *end = strchr(val, '&');
+        if (!end) end = val + strlen(val);
+        snprintf(val, (size_t)(end - val) + 1, "***");
+        q = end;                          /* 继续扫描后续参数 */
+    }
+    LOGI("RTSP: %s", safe);
 }
 
 /* 信号处理 */
