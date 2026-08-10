@@ -66,8 +66,10 @@ static gint64 g_jpeg_ts = 0;   /* 最近 JPEG 帧编码完成时刻 */
 static int jpeg_get_latest(void *ctx, jpeg_frame_t *out) {
     (void)ctx;
     pthread_mutex_lock(&g_jpeg_lock);
-    if (g_jpeg_data && g_jpeg_len > 0) {
-        out->data = g_jpeg_data;
+    /* 锁内拷贝到调用方缓冲 (out->data/cap): 帧生命周期归调用方,
+     * 不再共享 g_jpeg_data 裸指针 — 消除 UAF/撕裂帧 (扫1 #8) */
+    if (g_jpeg_data && g_jpeg_len > 0 && g_jpeg_len <= out->cap) {
+        memcpy(out->data, g_jpeg_data, g_jpeg_len);
         out->len = g_jpeg_len;
         out->ts = g_jpeg_ts;
         pthread_mutex_unlock(&g_jpeg_lock);

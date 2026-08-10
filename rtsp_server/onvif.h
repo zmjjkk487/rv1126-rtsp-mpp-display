@@ -34,10 +34,13 @@ void onvif_set_profiles(onvif_server_t *o, const onvif_profile_t *profiles,
 
 /* MJPEG 低延迟预览: 帧提供者 (producer 提供最新 JPEG 帧),
  * HTTP GET /preview 走 multipart/x-mixed-replace 推流, 延迟 100-300ms */
+/* 帧传递契约: data/cap 由调用方提供, provider 锁内拷贝到此处并写 len/ts;
+ * 帧生命周期归调用方 — 消除跨锁共享指针导致的 UAF (扫1 #8) */
 typedef struct {
-    const uint8_t *data;
-    size_t len;
-    int64_t ts;   /* 编码完成时刻 (g_get_monotonic_time), 延迟测量用 */
+    uint8_t *data;   /* 调用方缓冲 */
+    size_t cap;      /* 缓冲容量 */
+    size_t len;      /* 实际帧长 (provider 写入) */
+    int64_t ts;      /* 编码完成时刻 (g_get_monotonic_time), 延迟测量用 */
 } jpeg_frame_t;
 
 typedef int (*jpeg_provider_fn)(void *ctx, jpeg_frame_t *out);   /* 0=有帧 */

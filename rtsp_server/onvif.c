@@ -569,9 +569,16 @@ static void *preview_thread(void *arg) {
         return NULL;
     }
 
+    /* 帧缓冲归本线程所有: provider 锁内拷贝, 消除跨锁 UAF (扫1 #8) */
+    uint8_t *frm = malloc(1 << 20);   /* 1MB: D1 480p JPEG 远小于此 */
+    if (!frm) {
+        close(fd);
+        return NULL;
+    }
+
     long nframe = 0;
     for (;;) {
-        jpeg_frame_t f;
+        jpeg_frame_t f = { .data = frm, .cap = 1 << 20 };
         if (o->jpeg_fn && o->jpeg_fn(o->jpeg_ctx, &f) == 0 && f.len > 0) {
             char part[128];
             int n = snprintf(part, sizeof part,
@@ -591,6 +598,7 @@ static void *preview_thread(void *arg) {
             usleep(10000);   /* 无帧等 10ms */
         }
     }
+    free(frm);
     close(fd);
     return NULL;
 }
