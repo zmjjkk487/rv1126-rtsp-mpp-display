@@ -1118,7 +1118,9 @@ async fn handle_preview_start(
     let safe_url = url.replace('\'', "'\\''");
     /* 注意: 不要加 videoscale/videorate — A7 上 CPU 缩放 ~24fps 降到
      * 9fps, videorate 对 mppvideodec 输出的时间戳误丢帧 (~4.7fps)。
-     * D1 子码流原尺寸 JPEG 带宽 <1MB/s, 直出即可 */
+     * D1 子码流原尺寸 JPEG 带宽 <1MB/s, 直出即可。
+     * 曾尝试 CPU jpegenc (把 JPEG 挪出 MPP 核心): 解码器卡在
+     * mpp_buf_slot mismatch 循环, 0 帧输出 — 回滚 mppjpegenc */
     let cmd = format!(
         "gst-launch-1.0 -q rtspsrc location='{}' latency=100 protocols=4 \
          ! rtph264depay ! h264parse ! mppvideodec ! videoconvert \
