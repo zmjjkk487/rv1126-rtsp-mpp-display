@@ -613,10 +613,11 @@ function showTab(tab) {
 
 /* === 预览: HLS / MJPEG 低延迟切换 === */
 let previewMJPEG = false;
+let lastPreviewUrl = '';
 
-/* MJPEG 流在 producer 的 :80 (ONVIF HTTP 服务), 绕过 web_rust 直连 */
+/* MJPEG 低延迟预览: web 端转码代理 (/api/preview_start 拉指定摄像头 → JPEG 流) */
 function mjpegUrl() {
-  return 'http://' + window.location.hostname + ':80/preview';
+  return window.location.origin + '/preview';
 }
 
 function togglePreviewMode() {
@@ -624,7 +625,20 @@ function togglePreviewMode() {
   let img = document.getElementById('mjpeg-preview');
   let vid = document.getElementById('preview-video');
   if (previewMJPEG) {
-    img.src = mjpegUrl();
+    if (!lastPreviewUrl) { alert('先点一个码流的预览'); previewMJPEG = false; return; }
+    if (lastPreviewUrl.includes(window.location.hostname)) {
+      /* 板子自己: 原生 producer /preview (零额外 MPP 消耗) */
+      img.src = 'http://' + window.location.hostname + ':80/preview?t=' + Date.now();
+    } else {
+      /* 外部摄像头: web 转码代理 (建议子码流, 解码成本随源分辨率) */
+      apiFetch('/api/preview_start', {
+        method: 'POST',
+        body: JSON.stringify({url: lastPreviewUrl})
+      }).catch(()=>{});
+      setTimeout(() => {
+        img.src = mjpegUrl() + '?t=' + Date.now();
+      }, 300);
+    }
     img.style.display = '';
     vid.style.display = 'none';
     if (hlsPlayer) { hlsPlayer.destroy(); hlsPlayer = null; }
@@ -632,6 +646,7 @@ function togglePreviewMode() {
     img.src = '';
     img.style.display = 'none';
     vid.style.display = '';
+    apiFetch('/api/preview_stop', {method: 'POST'}).catch(()=>{});
   }
 }
 
@@ -639,6 +654,7 @@ function togglePreviewMode() {
 let hlsPlayer = null;
 function startPreview(rtspUrl) {
   if (!rtspUrl) { alert('该码流无 RTSP 地址'); return; }
+  lastPreviewUrl = rtspUrl;
   showTab('preview');
   document.getElementById('preview-video').src = '';
   document.getElementById('preview-video').load();
@@ -702,6 +718,7 @@ function stopPreview() {
   img.src = ''; img.style.display = 'none';
   previewMJPEG = false;
   apiFetch('/api/hls_stop', {method: 'POST'}).catch(()=>{});
+  apiFetch('/api/preview_stop', {method: 'POST'}).catch(()=>{});
 }
 
 function checkStatus() {

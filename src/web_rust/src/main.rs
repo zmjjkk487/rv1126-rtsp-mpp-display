@@ -13,6 +13,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::io::Read;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs;
@@ -1058,6 +1059,144 @@ async fn handle_hls_stop() -> Response {
     Json(serde_json::json!({"status":"ok"})).into_response()
 }
 
+// ─── MJPEG 低延迟预览 (转码代理: 任意 RTSP → JPEG 流) ─────────
+
+/// 全局: 转码进程 + JPEG 帧广播 (读线程推帧, 每个 /preview 连接 subscribe;
+/// 慢消费者自动 lag 丢旧帧 — 实时预览语义)
+static PREVIEW_CHILD: std::sync::Mutex<Option<std::process::Child>> =
+    std::sync::Mutex::new(None);
+static PREVIEW_TX: std::sync::Mutex<
+    Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
+> = std::sync::Mutex::new(None);
+
+/// POST /api/preview_start — 启动低延迟预览 (body: {"url":"rtsp://..."})
+/// gst-launch 拉流 → 硬解 → 缩到 640x360 → mppjpegenc → JPEG 帧流
+async fn handle_preview_start(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if !check_auth(&state, &headers).await { return unauthorized(); }
+    let url = body["url"].as_str().unwrap_or("").to_string();
+    if url.is_empty() {
+        return (StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":"missing url"}))).into_response();
+    }
+
+    // 停旧的
+    if let Some(mut old) = PREVIEW_CHILD.lock().unwrap().take() {
+        let _ = old.kill();
+        let _ = old.wait();
+    }
+    *PREVIEW_TX.lock().unwrap() = None;
+
+    // shell 转义单引号 (URL 可能含 ?username= 等)
+    let safe_url = url.replace('\'', "'\\''");
+    /* 注意: 不要加 videoscale/videorate — A7 上 CPU 缩放 ~24fps 降到
+     * 9fps, videorate 对 mppvideodec 输出的时间戳误丢帧 (~4.7fps)。
+     * D1 子码流原尺寸 JPEG 带宽 <1MB/s, 直出即可 */
+    let cmd = format!(
+        "gst-launch-1.0 -q rtspsrc location='{}' latency=100 protocols=4 \
+         ! rtph264depay ! h264parse ! mppvideodec ! videoconvert \
+         ! mppjpegenc ! fdsink fd=1 \
+         </dev/null 2>/tmp/preview_gst.log",
+        safe_url);
+
+    let mut child = match std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&cmd)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("spawn: {e}")}))).into_response(),
+    };
+
+    let stdout = child.stdout.take().expect("stdout piped");
+    *PREVIEW_CHILD.lock().unwrap() = Some(child);
+
+    let (tx, _) = tokio::sync::broadcast::channel::<Vec<u8>>(8);
+    *PREVIEW_TX.lock().unwrap() = Some(tx.clone());
+
+    // 读线程: 按 JPEG 标记 (FFD8 开头 / FFD9 结尾) 切帧, 组装 multipart 段
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut state: u8 = 0;      // 0=找帧头 1=FF后 2=帧内 3=帧内FF后
+        let mut frame: Vec<u8> = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            match reader.read(&mut byte) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let b = byte[0];
+                    match state {
+                        0 => { if b == 0xFF { frame.push(b); state = 1; } }
+                        1 => { frame.push(b);
+                               state = if b == 0xD8 { 2 } else { frame.clear(); 0 }; }
+                        2 => { frame.push(b);
+                               if b == 0xFF { state = 3; }
+                               else if frame.len() > 1_000_000 { frame.clear(); state = 0; } }
+                        _ => { frame.push(b);
+                               if b == 0xD9 {
+                                   /* 一帧完整: 组 multipart 段 */
+                                   let head = format!("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n", frame.len());
+                                   let mut out = head.into_bytes();
+                                   out.extend_from_slice(&frame);
+                                   out.extend_from_slice(b"\r\n");
+                                   let _ = tx.send(out);   /* 广播; 无接收者/慢接收者不影响 */
+                                   frame.clear(); state = 0;
+                               } else {
+                                   state = if b == 0xD8 { 2 } else { 2 };
+                               } }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    (StatusCode::OK, Json(serde_json::json!({"status":"ok"}))).into_response()
+}
+
+/// GET /preview — 浏览器低延迟预览 (multipart/x-mixed-replace 流)
+async fn handle_preview() -> Response {
+    let tx = PREVIEW_TX.lock().unwrap().clone();
+    let Some(tx) = tx else {
+        return (StatusCode::NOT_FOUND, "preview not started").into_response();
+    };
+    let rx = tx.subscribe();
+    let stream = futures::stream::unfold(rx, |mut rx| async move {
+        loop {
+            match rx.recv().await {
+                Ok(frame) => {
+                    return Some((Ok::<_, std::convert::Infallible>(
+                        axum::body::Bytes::from(frame)), rx));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    continue;   /* 慢消费者丢帧: 跳过继续 (实时预览语义) */
+                }
+                Err(_) => return None,   /* channel 关闭: 流结束 */
+            }
+        }
+    });
+    Response::builder()
+        .header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        .header("Cache-Control", "no-cache")
+        .body(axum::body::Body::from_stream(stream))
+        .unwrap()
+}
+
+/// POST /api/preview_stop — 停止低延迟预览
+async fn handle_preview_stop() -> Response {
+    if let Some(mut c) = PREVIEW_CHILD.lock().unwrap().take() {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    *PREVIEW_TX.lock().unwrap() = None;
+    Json(serde_json::json!({"status":"ok"})).into_response()
+}
+
 /// POST /api/ircut — 切换日夜模式 (body: {"mode":"day"} / {"mode":"night"})
 async fn handle_ircut(
     State(state): State<Arc<AppState>>,
@@ -1485,6 +1624,9 @@ async fn main() {
         .route("/api/status", get(handle_status))
         .route("/api/hls_start", post(handle_hls_start))
         .route("/api/hls_stop", post(handle_hls_stop))
+        .route("/api/preview_start", post(handle_preview_start))
+        .route("/api/preview_stop", post(handle_preview_stop))
+        .route("/preview", get(handle_preview))
         .route("/api/ircut", post(handle_ircut))
         .route("/hls/stream.m3u8", get(handle_hls_m3u8))
         .route("/hls/:filename", get(handle_hls_ts))

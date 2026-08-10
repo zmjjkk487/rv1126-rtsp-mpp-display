@@ -132,14 +132,6 @@ static GstFlowReturn on_new_sample(GstAppSink *appsink, gpointer user_data) {
                 g_jpeg_ts = g_get_monotonic_time();
             }
             pthread_mutex_unlock(&g_jpeg_lock);
-            {   /* 调试: 首帧确认 ts 已写入 */
-                static int jpeg_first = 1;
-                if (jpeg_first) {
-                    printf("[DEBUG-jpeg] 首帧 ts=%lld\n",
-                           (long long)g_jpeg_ts);
-                    jpeg_first = 0;
-                }
-            }
             gst_buffer_unmap(buf, &map);
         }
     } else if (st->raw_sink && appsink == st->raw_sink) {
@@ -324,7 +316,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* 三码流参数 (预算内: 总需求 123M < 127M) */
+    /* 三码流参数 (预算内: 1080p@20 + 720p@30 + LCD = 101M < 127M) */
     g_st[ST_MAIN].device = "/dev/video-camera0";
     g_st[ST_MAIN].w = 2688; g_st[ST_MAIN].h = 1520;
     g_st[ST_MAIN].bps = 5000000; g_st[ST_MAIN].fps = 15;
@@ -336,7 +328,7 @@ int main(int argc, char *argv[]) {
 
     g_st[ST_480].device = NULL;              /* 1080p 帧 CPU 缩放 */
     g_st[ST_480].w = 1280; g_st[ST_480].h = 720;
-    g_st[ST_480].bps = 2000000; g_st[ST_480].fps = 60;
+    g_st[ST_480].bps = 1500000; g_st[ST_480].fps = 30;
 
     for (int i = 0; i < 3; i++) {
         if (i == ST_MAIN) {          /* 实验: 主线禁用, 预算全给子线 */
