@@ -160,8 +160,6 @@ rv1126_rtsp_mpp_demo/
 │       ├── index.html       # Web 管理界面 (扫描/连接/预览/状态)
 │       └── hls.min.js       # HLS.js 播放器
 │
-├── legacy_web/              # 废弃的 C 版 Web 后台 (参考用)
-│
 ├── docs/
 │   ├── DEPLOY.md            # 部署与操作手册
 │   └── dev-log.md           # 开发历史记录
