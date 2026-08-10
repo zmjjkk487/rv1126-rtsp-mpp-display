@@ -283,6 +283,12 @@ async function doLogin() {
       sessionStorage.setItem('web_token', d.token);
       showMain();
       doScan();
+      if (d.default_pw) {
+        /* 出厂默认密码警告: 引导立即改密 */
+        alert('安全警告: 当前使用出厂默认密码, 请立即修改!');
+        showTab('settings');
+        document.getElementById('old-pass').focus();
+      }
     } else {
       errEl.textContent = d.error || '登录失败';
     }

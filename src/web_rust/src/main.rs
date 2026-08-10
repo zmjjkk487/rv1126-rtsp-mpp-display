@@ -808,7 +808,9 @@ async fn handle_login(
     state.login_fails.lock().await.clear();
     let token = gen_token();
     state.sessions.lock().await.insert(token.clone(), now + 86400);
-    (StatusCode::OK, Json(serde_json::json!({"status":"ok","token":token}))).into_response()
+    /* 默认密码提醒: 前端收到 default_pw=true 强制引导改密 (扫1 #5) */
+    let is_default = *state.pw_hash.lock().await == DEFAULT_HASH;
+    (StatusCode::OK, Json(serde_json::json!({"status":"ok","token":token,"default_pw":is_default}))).into_response()
 }
 
 /// POST /api/change_password — 修改登录密码
@@ -1311,6 +1313,15 @@ async fn handle_power(
     Json(serde_json::json!({"status":"ok","action":action})).into_response()
 }
 
+/// 校验 NTP 服务器字段: 只允许 域名/IPv4/IPv6 字符 (字母数字 . - : _),
+/// 其余一律拒绝 — 防 server 参数注入 shell (扫1 #4 高危)
+fn sanitize_ntp_server(s: &str) -> String {
+    let ok = !s.is_empty()
+        && s.len() <= 253
+        && s.bytes().all(|c| c.is_ascii_alphanumeric() || b".-:_".contains(&c));
+    if ok { s.to_string() } else { String::new() }
+}
+
 /// GET /api/time — 获取当前系统时间
 /// POST /api/time — NTP 校时 (body: {"server":"ntp.aliyun.com"} 可选)
 async fn handle_time(
@@ -1328,16 +1339,19 @@ async fn handle_time(
         return Json(serde_json::json!({"status":"ok","time":time_str})).into_response();
     }
 
-    // POST: NTP 校时
+    // POST: NTP 校时 — 白名单校验 + 参数数组执行 (不经过 shell)
     let body_bytes = axum::body::to_bytes(req.into_body(), 4096).await.unwrap_or_default();
     let server = serde_json::from_slice::<serde_json::Value>(&body_bytes)
         .ok()
         .and_then(|v| v["server"].as_str().map(|s| s.to_string()))
         .unwrap_or_else(|| "ntp.aliyun.com".to_string());
+    let server = sanitize_ntp_server(&server);
+    let server = if server.is_empty() { "ntp.aliyun.com".to_string() } else { server };
 
-    let _ = Command::new("sh")
-        .arg("-c")
-        .arg(format!("ntpd -q -p {} >/dev/null 2>&1", server))
+    let _ = Command::new("ntpd")
+        .args(["-q", "-p", &server])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .output()
         .await;
 
