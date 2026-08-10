@@ -684,9 +684,12 @@ fn hls_playlist(token: &str) -> String {
 // ─── Pipeline Control ───────────────────────────────────────
 
 async fn pipeline_connect(base_url: &str, user: &str, pass: &str) -> Option<String> {
-    // Save credentials — 显式 0600, 防同机其他用户读取 (扫1 #21)
-    let _ = fs::write(CREDS_FILE, format!("{}:{}\n", user, pass)).await;
-    let _ = Command::new("chmod").args(["600", CREDS_FILE]).output().await;
+    // Save credentials — 密码为空不覆盖旧凭据: 注入 admin:@ 空凭据会 401,
+    // URL 自带 ?username=&password= 时让摄像头侧认证生效即可
+    if !pass.is_empty() {
+        let _ = fs::write(CREDS_FILE, format!("{}:{}\n", user, pass)).await;
+        let _ = Command::new("chmod").args(["600", CREDS_FILE]).output().await;
+    }
 
     // Save config.ini
     let cfg = format!(

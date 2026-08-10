@@ -371,7 +371,9 @@ int main(int argc, char *argv[]) {
                 size_t l = strlen(line);
                 while (l > 0 && (line[l-1] == '\n' || line[l-1] == '\r')) line[--l] = '\0';
                 char *colon = strchr(line, ':');
-                if (colon) {
+                /* 密码为空不注入: 让 URL 自带的 ?username=&password= 认证生效
+                 * (海康 GetStreamUri 格式); 注入 admin:@ 空凭据反而 401 */
+                if (colon && colon[1] != '\0') {
                     *colon = '\0';
                     const char *proto = strstr(g_cfg.rtsp_url, "://");
                     if (proto) {
