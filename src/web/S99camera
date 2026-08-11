@@ -57,6 +57,11 @@ start)
         }
     done ) &
     echo "  看门狗已启动"
+
+    # producer (板子当摄像头) 看门狗: MPP 编码器偶发被饿死崩溃, 崩了自动重启
+    # (脚本: producer_watchdog.sh — 处理 :80 被 nginx 占用 + 端口释放竞态)
+    /root/producer_watchdog.sh >/dev/null 2>&1 &
+    echo "  producer 看门狗已启动"
     ;;
 stop)
     killall -9 rv1126_web 2>/dev/null
