@@ -97,6 +97,15 @@ pre{background:#0a0e17;padding:10px;border-radius:8px;overflow-x:auto;font-size:
               onmousedown="ptzMove('right')" onmouseup="ptzStop()" onmouseleave="ptzStop()"
               ontouchstart="ptzMove('right')" ontouchend="ptzStop()">右转 &#x25B6;</button>
     </div>
+    <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
+      <span style="font-size:13px;color:#666">&#x1F4CB; 预置位:</span>
+      <input id="preset-name" placeholder="名称(可选)" style="flex:1;font-size:12px;padding:4px">
+      <button class="btn" style="background:#059669;color:#fff;border:none;border-radius:6px;cursor:pointer"
+              onclick="presetSet()">&#x2B50; 设置当前位置</button>
+      <button class="btn" style="background:#555;color:#fff;border:none;border-radius:6px;cursor:pointer"
+              onclick="presetRefresh()">&#x1F504; 刷新</button>
+    </div>
+    <div id="preset-list" style="margin-top:8px;font-size:12px;color:#666"></div>
   </div>
 </div>
 
@@ -624,6 +633,7 @@ function showTab(tab) {
   if (tab === 'device') { loadCamNetwork(); }
   if (tab === 'system') { checkStatus(); loadSysInfo(); loadLogs(); }
   if (tab === 'settings') { loadNetwork(); loadTime(); }
+  if (tab === 'preview') { presetRefresh(); }
   if (tab === 'scan' && !document.getElementById('scan-result').innerHTML) doScan();
 }
 
@@ -750,23 +760,58 @@ function stopPreview() {
   apiFetch('/api/preview_stop', {method: 'POST'}).catch(()=>{});
 }
 
-/* === 云台控制: 按住转, 松开停 (ContinuousMove → Stop) === */
-/* 控制目标 = 本机摄像头 (板子自己, 浏览器访问的地址):
- * 指令必须到板子才会触发屏幕箭头; 跟随预览码流会把指令发到
- * 海康 (无预览时回退 config.ini), 板子收不到指令 → 箭头不出现 */
-function ptzTargetIp() {
-  return window.location.hostname || '';
-}
+/* === 云台控制: 按住转, 松开停 (ContinuousMove → Stop) ===
+ * 控制目标 = 当前连接的摄像头 (后端按 config.ini 决定):
+ *   连接网络云台摄像头 → ONVIF 指令发给它 (真实转动)
+ *   连接本机 (无电机)   → 指令到板子, 屏幕箭头可视化验证
+ * 不传 ip: 后端回退 camera_ip() — 与"连接谁显示谁"一致 */
 function ptzMove(dir) {
   apiFetch('/api/ptz', {
     method: 'POST',
-    body: JSON.stringify({dir: dir, ip: ptzTargetIp()})
+    body: JSON.stringify({dir: dir})
   }).catch(()=>{});
 }
 function ptzStop() {
   apiFetch('/api/ptz', {
     method: 'POST',
-    body: JSON.stringify({dir: 'stop', ip: ptzTargetIp()})
+    body: JSON.stringify({dir: 'stop'})
+  }).catch(()=>{});
+}
+
+/* === 云台预置位 (SetPreset/GotoPreset/RemovePreset) === */
+function presetSet() {
+  let name = document.getElementById('preset-name').value || '';
+  apiFetch('/api/ptz', {
+    method: 'POST',
+    body: JSON.stringify({dir: 'preset_set', name: name})
+  }).then(() => { presetRefresh(); }).catch(()=>{});
+}
+function presetGoto(token) {
+  apiFetch('/api/ptz', {
+    method: 'POST',
+    body: JSON.stringify({dir: 'preset_goto', token: token})
+  }).catch(()=>{});
+}
+function presetRemove(token) {
+  apiFetch('/api/ptz', {
+    method: 'POST',
+    body: JSON.stringify({dir: 'preset_remove', token: token})
+  }).then(() => { presetRefresh(); }).catch(()=>{});
+}
+function presetRefresh() {
+  apiFetch('/api/presets').then(r => r.json()).then(d => {
+    let el = document.getElementById('preset-list');
+    if (!d.presets || d.presets.length === 0) {
+      el.innerHTML = '<span style="color:#999">(暂无预置位 — 对准位置后点"设置当前位置")</span>';
+      return;
+    }
+    el.innerHTML = d.presets.map(p =>
+      '<div style="display:flex;gap:8px;align-items:center;margin:4px 0">' +
+      '<span style="min-width:30px;font-weight:bold">'+esc(p.token)+'</span>' +
+      '<span style="flex:1">'+esc(p.name)+'</span>' +
+      '<button class="btn" style="font-size:11px;padding:3px 10px;background:#1d4ed8;color:#fff;border:none;border-radius:5px;cursor:pointer" onclick="presetGoto(\''+esc(p.token)+'\')">&#x25B6; 调用</button>' +
+      '<button class="btn" style="font-size:11px;padding:3px 10px;background:#dc2626;color:#fff;border:none;border-radius:5px;cursor:pointer" onclick="presetRemove(\''+esc(p.token)+'\')">&#x2715; 删除</button>' +
+      '</div>').join('');
   }).catch(()=>{});
 }
 

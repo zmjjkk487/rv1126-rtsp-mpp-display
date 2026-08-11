@@ -1271,21 +1271,79 @@ async fn handle_ircut(
     }
 }
 
-/// 发送 ONVIF PTZ 指令 (ContinuousMove 左/右转, Stop 停止)
-async fn onvif_ptz(ip: &str, user: &str, pass: &str, dir: &str) -> bool {
+/// XML 转义 (防注入 ONVIF 请求)
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// 发送 ONVIF PTZ 指令 (方向 / 停止 / 预置位)
+async fn onvif_ptz(ip: &str, user: &str, pass: &str, dir: &str,
+                   token: &str, name: &str) -> bool {
     let body = match dir {
-        "left" => r#"<tptz:ContinuousMove><tptz:ProfileToken>MainStream</tptz:ProfileToken><tptz:Velocity><tt:PanTilt><tt:x>-1</tt:x><tt:y>0</tt:y></tt:PanTilt></tptz:Velocity></tptz:ContinuousMove>"#,
-        "right" => r#"<tptz:ContinuousMove><tptz:ProfileToken>MainStream</tptz:ProfileToken><tptz:Velocity><tt:PanTilt><tt:x>1</tt:x><tt:y>0</tt:y></tt:PanTilt></tptz:Velocity></tptz:ContinuousMove>"#,
-        _ => r#"<tptz:Stop><tptz:ProfileToken>MainStream</tptz:ProfileToken><tptz:PanTilt>true</tptz:PanTilt></tptz:Stop>"#,
+        "left" => r#"<tptz:ContinuousMove><tptz:ProfileToken>MainStream</tptz:ProfileToken><tptz:Velocity><tt:PanTilt><tt:x>-1</tt:x><tt:y>0</tt:y></tt:PanTilt></tptz:Velocity></tptz:ContinuousMove>"#.to_string(),
+        "right" => r#"<tptz:ContinuousMove><tptz:ProfileToken>MainStream</tptz:ProfileToken><tptz:Velocity><tt:PanTilt><tt:x>1</tt:x><tt:y>0</tt:y></tt:PanTilt></tptz:Velocity></tptz:ContinuousMove>"#.to_string(),
+        "preset_set" => {
+            /* 无 token 自动分配 P1..P8: 查现有列表找空位 */
+            let tok = if token.is_empty() {
+                let presets = onvif_get_presets(ip, user, pass).await;
+                let mut t = String::new();
+                for i in 1..=8 {
+                    let cand = format!("P{}", i);
+                    if !presets.iter().any(|(tk, _)| tk == &cand) {
+                        t = cand;
+                        break;
+                    }
+                }
+                t
+            } else {
+                token.to_string()
+            };
+            format!(
+                r#"<tptz:SetPreset><tptz:ProfileToken>MainStream</tptz:ProfileToken><tptz:PresetName>{}</tptz:PresetName><tptz:PresetToken>{}</tptz:PresetToken></tptz:SetPreset>"#,
+                xml_escape(if name.is_empty() { &tok } else { name }),
+                xml_escape(&tok))
+        }
+        "preset_goto" => format!(
+            r#"<tptz:GotoPreset><tptz:ProfileToken>MainStream</tptz:ProfileToken><tptz:PresetToken>{}</tptz:PresetToken></tptz:GotoPreset>"#,
+            xml_escape(token)),
+        "preset_remove" => format!(
+            r#"<tptz:RemovePreset><tptz:ProfileToken>MainStream</tptz:ProfileToken><tptz:PresetToken>{}</tptz:PresetToken></tptz:RemovePreset>"#,
+            xml_escape(token)),
+        _ => r#"<tptz:Stop><tptz:ProfileToken>MainStream</tptz:ProfileToken><tptz:PanTilt>true</tptz:PanTilt></tptz:Stop>"#.to_string(),
     };
-    let xml = match soap_post(&format!("http://{}/onvif/device_service", ip), body, user, pass).await {
+    let xml = match soap_post(&format!("http://{}/onvif/device_service", ip), &body, user, pass).await {
         Ok(x) => x,
         Err(_) => return false,
     };
     !xml.contains("Fault")
 }
 
-/// POST /api/ptz — 云台控制 (body: {"dir":"left"|"right"|"stop"})
+/// 读取目标摄像头已保存的预置位列表 [(token, name)]
+async fn onvif_get_presets(ip: &str, user: &str, pass: &str) -> Vec<(String, String)> {
+    let body = r#"<tptz:GetPresets><tptz:ProfileToken>MainStream</tptz:ProfileToken></tptz:GetPresets>"#;
+    let xml = match soap_post(&format!("http://{}/onvif/device_service", ip), body, user, pass).await {
+        Ok(x) => x,
+        Err(_) => return vec![],
+    };
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while let Some(start) = xml[pos..].find("<tptz:Preset>") {
+        let seg = &xml[pos + start..];
+        let token = extract_xml_val(seg, "tptz:PresetToken", |v| Some(v.to_string()))
+            .unwrap_or_default();
+        let name = extract_xml_val(seg, "tptz:PresetName", |v| Some(v.to_string()))
+            .unwrap_or_else(|| token.clone());
+        if !token.is_empty() {
+            out.push((token, name));
+        }
+        pos += start + 8;
+    }
+    out
+}
+
+/// POST /api/ptz — 云台控制 (body: {"dir":"left"|"right"|"stop",
+/// "preset_set"|"preset_goto"|"preset_remove", "token":"P1", "name":"门口"})
 /// 目标 = 当前连接的码流所属摄像头 (camera_ip, 标准 ONVIF 语义:
 /// 连接哪个码流就控制那个摄像头的云台; 连本机码流 → 板子收到指令
 /// 屏幕画箭头验证, 连海康 → 指令发给海康)
@@ -1297,8 +1355,15 @@ async fn handle_ptz(
     if !check_auth(&state, &headers).await { return unauthorized(); }
 
     let dir = body["dir"].as_str().unwrap_or("").to_string();
-    if dir != "left" && dir != "right" && dir != "stop" {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"dir must be left/right/stop"}))).into_response();
+    let valid = ["left", "right", "stop", "preset_set", "preset_goto",
+                 "preset_remove"].contains(&dir.as_str());
+    if !valid {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"invalid dir"}))).into_response();
+    }
+    let token = body["token"].as_str().unwrap_or("").to_string();
+    let name = body["name"].as_str().unwrap_or("").to_string();
+    if (dir == "preset_goto" || dir == "preset_remove") && token.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"token required"}))).into_response();
     }
 
     /* 控制目标: 前端传当前预览码流的 IP (连接谁控制谁);
@@ -1312,12 +1377,33 @@ async fn handle_ptz(
         None => ("admin".to_string(), "123456".to_string()),
     };
 
-    let ok = onvif_ptz(&ip, &user, &pass, &dir).await;
+    let ok = onvif_ptz(&ip, &user, &pass, &dir, &token, &name).await;
     if ok {
         Json(serde_json::json!({"status":"ok","dir":dir})).into_response()
     } else {
         (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error":"ptz command failed"}))).into_response()
     }
+}
+
+/// GET /api/presets — 预置位列表 (当前连接摄像头的 GetPresets)
+async fn handle_presets(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if !check_auth(&state, &headers).await { return unauthorized(); }
+
+    let ip = camera_ip();
+    let creds = std::fs::read_to_string(CREDS_FILE).unwrap_or_default();
+    let (user, pass) = match creds.trim().split_once(':') {
+        Some((u, p)) => (u.to_string(), p.to_string()),
+        None => ("admin".to_string(), "123456".to_string()),
+    };
+
+    let presets: Vec<serde_json::Value> = onvif_get_presets(&ip, &user, &pass).await
+        .into_iter()
+        .map(|(token, name)| serde_json::json!({"token": token, "name": name}))
+        .collect();
+    Json(serde_json::json!({"status":"ok","presets":presets})).into_response()
 }
 
 /// GET /api/system_info — 系统信息 (版本/内存/运行时长/网络)
@@ -1742,6 +1828,7 @@ async fn main() {
         .route("/preview", get(handle_preview))
         .route("/api/ircut", post(handle_ircut))
         .route("/api/ptz", post(handle_ptz))
+        .route("/api/presets", get(handle_presets))
         .route("/hls/stream.m3u8", get(handle_hls_m3u8))
         .route("/hls/:filename", get(handle_hls_ts))
         .route("/", get(handle_index))
