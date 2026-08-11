@@ -30,9 +30,12 @@ RTSP 服务器、RTP 分包、ONVIF 协议栈**全部从零手写**（不依赖 
 
 - 🖥️ **RTSP 拉流硬解显示**：rtspsrc → mppvideodec → RGA → fbdev，CPU < 15%，断线自动重连
 - 📷 **板子即摄像头**：IMX415 → mpph264enc 硬件编码 → RTSP 双码流（主码流 2K / 子码流 1080p）
-- 🔌 **自研 RTSP 服务器**：多挂载点、TCP interleaved、FU-A 分包、慢客户端丢帧不阻塞
+- 🔌 **自研 RTSP 服务器**：多挂载点、TCP interleaved、FU-A 分包、慢客户端整帧丢弃不花屏
 - 🌐 **自研 ONVIF 应答端**：WS-Discovery 组播发现 + SOAP 服务 13+ 接口，通过 ODM 严格 XML 校验
-- 🎛️ **Web 管理平台**（Rust/axum）：ONVIF 自动发现摄像头、一键连接上屏、浏览器 HLS 预览、登录认证
+- 🎛️ **Web 管理平台**（Rust/axum）：ONVIF 自动发现摄像头、一键连接上屏、浏览器 HLS/MJPEG 预览、登录认证
+- 🎥 **云台控制 (ONVIF PTZ)**：ContinuousMove 方向控制 + SetPreset/GotoPreset 预置位管理；
+  本机无云台 → 屏幕箭头/预置位标识可视化验证，真实云台换回调实现即可
+- 🛡️ **自愈守护**：producer 崩溃看门狗 + 显示帧看门狗（解码器卡死自动重启），开机自启
 - 📊 **真机验证**：全部功能在 ATK-DLRV1126B 实板跑通，含帧率测量脚本（measure_streams.py）
 
 ---

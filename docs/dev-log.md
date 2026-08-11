@@ -644,3 +644,56 @@ GST_DEBUG_BIN_TO_DOT_FILE=1 ./rv1126_gst_display
 | RGA 硬件加速 | ✅ librga.so 存在, API v1.10.5 |
 | DRM 显示 | ⚠️ kmssink 有 connector-id 兼容问题 |
 | 摄像头分辨率 | 704×576 H.264 High 15fps |
+
+---
+
+## 12. 云台协议 (ONVIF PTZ) 开发记录 — 2026-08-11
+
+### 需求
+板子作为标准摄像头, 支持 ONVIF 云台协议 (方向 + 预置位)。本机无云台电机,
+用屏幕标识可视化验证"摄像头确实收到指令": 方向 → 红色箭头, 预置位 → "P1" 字样。
+
+### 架构
+```
+前端按钮 → /api/ptz → ONVIF ContinuousMove/SetPreset/GotoPreset
+→ producer onvif.c 解析成功 (= 接受指令) → 立即回调
+→ producer 回调写 /tmp/ptz_dir → 显示端每 5 帧读取 → fb 叠加标识 (3 秒)
+```
+回调在接受指令之后 — 换真实云台只改 producer 回调实现 (文件 → 电机)。
+
+### 关键踩坑 (按发现顺序)
+
+1. **写解码 DMABUF → IOMMU 页错误 → 解码器挂死** (卡死根因)
+   最初箭头直接写 appsink 的 DMABUF (`gst_buffer_map(GST_MAP_READ)` 只读映射)。
+   写 DMABUF 破坏 DMA 一致性 → `rk_iommu: Page fault` → 解码器挂死 → 画面冻结。
+   诊断方法: 显示端加 2 秒分辨率帧心跳 [FPS], 基线/指令差分回路实锤"一发指令就卡"。
+   修复: 箭头画在 fbdev back 缓冲 (自己的内存), RGA 转换后、写显存前叠加。
+
+2. **RGA 成功路径 goto write_fb 跳过叠加代码**
+   箭头绘制挂在 CPU 回退路径后面, RGA 硬件路径 `goto write_fb` 直接跳过 →
+   箭头不显示。修复: 叠加移到 `write_fb:` 标签处 (两条路径都覆盖)。
+
+3. **前端目标跟随预览码流 → 指令发错对象**
+   无预览时 lastPreviewUrl 为空 → 回退 config.ini → 指令发到海康,
+   板子收不到 → 箭头不出现。修复: 目标 = 当前连接摄像头 (camera_ip)。
+
+4. **fscanf 格式陷阱**: `%15s %lld` 解析 "PRESET P1 goto <ts>" 时
+   "P1" 不是数字 → 整个解析失败, 预置位分支永远进不去。
+   修复: 分步解析 (先读 dir, 再按类型读剩余字段)。
+
+5. **状态过期不清除**: until 过期后 ptz_label 未置空 → 预置位永久显示。
+   修复: 过期分支显式清空标签。
+
+6. **HTTP 单线程拖住指令**: 慢连接占用 accept 线程 → PTZ 响应 1-2 秒。
+   修复: 接收超时 5s→500ms, 实测响应 286ms。
+
+7. **FU-A 半截 NAL → 花屏**: 发送中途失败继续发后续分片。
+   修复: 失败即 break (丢弃剩余分片); 注意不要发送前 poll 检查可写性 —
+   会连 SPS/PPS 一起丢 → 解码器启动死锁。
+
+### 设计要点 (产品化直接复用)
+- 回调即插即换: `on_ptz_command` / `on_ptz_preset` 当前写文件,
+  接真实云台 (串口 Pelco-D / GPIO / 网络 ONVIF) 只改这两个函数
+- 预置位存储: 内存 (最多 8 个, token|name), producer 重启丢失 —
+  产品化需持久化 flash 并保存电机位置
+- 屏幕叠加走 fb 层而非解码层: 嵌入式显示叠加的正确姿势
