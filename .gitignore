@@ -1,6 +1,10 @@
 # 编译产物
+*.o
 output/
 output_native/
+producer
+file_source
+nal_parse
 
 # Rust 编译产物 (726MB, 必须忽略)
 src/web_rust/target/
