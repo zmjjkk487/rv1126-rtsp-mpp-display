@@ -6,7 +6,9 @@
 #         GST_LIBS="--sysroot=<SYS> -L<SYS>/usr/lib -lgstreamer-1.0 -lgobject-2.0 -lglib-2.0 -lgmodule-2.0 -lgstapp-1.0 -lgstvideo-1.0 -lm -ldl"
 
 CC      ?= gcc
+CXX     ?= g++
 CFLAGS  += -O2 -std=c11 -Wall -Wextra
+CXXFLAGS = -O2 -std=c++11 -Wall
 LDLIBS   = -pthread
 
 TARGET   = file_source
@@ -17,8 +19,8 @@ all: $(TARGET)
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDLIBS)
 
-producer: producer.o rtsp_server.o nal.o onvif.o
-	$(CC) $(CFLAGS) -o $@ $^ $(GST_LIBS) -pthread
+producer: producer.o rtsp_server.o nal.o onvif.o npu/detect.o npu/postprocess.o
+	$(CC) $(CFLAGS) -o $@ $^ $(GST_LIBS) -pthread -lrknnrt -lstdc++
 
 producer.o: producer.c
 	$(CC) $(CFLAGS) $(GST_CFLAGS) -c $<
@@ -26,8 +28,15 @@ producer.o: producer.c
 onvif.o: onvif.c onvif.h
 	$(CC) $(CFLAGS) -c $<
 
+# NPU 检测 (C++ 编译: 后处理用了 STL; rknn_api.h 在本目录)
+npu/detect.o: npu/detect.c npu/detect.h
+	$(CXX) $(CXXFLAGS) -Inpu -c $< -o $@
+
+npu/postprocess.o: npu/postprocess.cc npu/postprocess.h
+	$(CXX) $(CXXFLAGS) -Inpu -c $< -o $@
+
 %.o: %.c nal.h rtsp_server.h
 	$(CC) $(CFLAGS) -c $<
 
 clean:
-	rm -f *.o $(TARGET) producer
+	rm -f *.o $(TARGET) producer npu/*.o

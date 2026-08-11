@@ -26,16 +26,20 @@
 #include "nal.h"
 #include "onvif.h"
 #include "rtsp_server.h"
+#include "npu/detect.h"
 
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
 #include <gst/gst.h>
+#include <gst/video/video.h>
 
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+static unsigned long det_feed_cnt = 0;   /* NPU 检测喂帧计数 (每 3 帧一次) */
 
 #define DEFAULT_PORT 8554
 
@@ -170,7 +174,34 @@ static GstFlowReturn on_new_sample(GstAppSink *appsink, gpointer user_data) {
             gst_buffer_unmap(buf, &map);
         }
     } else if (st->raw_sink && appsink == st->raw_sink) {
-        /* 原始帧出口: NV12 → 推给 480p 管线 (videoscale 缩放编码) */
+        /* 原始帧出口: NV12 → NPU 检测 (每 3 帧) + 推给 480p 管线 */
+        if (buf && ++det_feed_cnt % 3 == 0) {
+            GstMapInfo dm;
+            if (gst_buffer_map(buf, &dm, GST_MAP_READ)) {
+                int w = 1920, h = 1080, hs = 1920;   /* 1080p 采集 */
+                GstCaps *sc = gst_sample_get_caps(sample);
+                if (sc) {
+                    GstVideoInfo vi;
+                    gst_video_info_init(&vi);
+                    if (gst_video_info_from_caps(&vi, sc)) {
+                        w = vi.width;
+                        h = vi.height;
+                        hs = GST_VIDEO_INFO_PLANE_STRIDE(&vi, 0);
+                    }
+                }
+                detect_feed(dm.data, dm.data + (size_t)w * h, w, h, hs);
+                gst_buffer_unmap(buf, &dm);
+                det_box_t boxes[8];
+                int nb = detect_get(boxes, 8);
+                if (nb > 0) {
+                    printf("[detect] %d 个目标 (帧 %lu): ",
+                           nb, st->feed_count);
+                    for (int i = 0; i < nb; i++)
+                        printf("c%d@%.2f ", boxes[i].cls, boxes[i].conf);
+                    printf("\n");
+                }
+            }
+        }
         if (st->push_src && buf) {
             /* 第一帧: 用 sample 的完整 caps (含分辨率) 设置 appsrc —
              * 只给 format 会让 videoscale 无法协商 (not-negotiated) */
@@ -390,6 +421,10 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "[producer] ONVIF 启动失败 (摄像头管理将搜不到本机)\n");
     else
         printf("[producer] ONVIF 就绪: 3 profile\n");
+
+    /* NPU 人形检测 (模型缺失时跳过, 不影响推流) */
+    if (detect_init("/root/yolov8n_rv1126b_fp.rknn") != 0)
+        printf("[producer] NPU 检测不可用 (模型未部署?), 跳过\n");
 
     printf("[producer] 拉流地址:\n"
            "  rtsp://<板子IP>:%d/stream0  (主码流 2K@15)\n"
