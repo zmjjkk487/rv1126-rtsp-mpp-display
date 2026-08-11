@@ -129,6 +129,29 @@ Web 每次连接成功自动写入。**改这个文件 = 改开机自动连接�
   `goto write_fb` 跳过中间代码
 - 预置位存内存 (producer 重启丢失), 产品化需持久化到 flash
 
+### 6.2 NPU 人形检测
+
+**架构**: producer 采集的 NV12 帧每 3 帧喂一次检测线程 → 板载 NPU
+(rknpu) 跑 yolov8n 推理 → 检测到人实时打印日志。与 MPP 编解码完全
+独立, 不影响推流。
+
+| 项 | 说明 |
+|---|---|
+| 模型 | `/root/yolov8n_rv1126b_fp.rknn` (PC 端 rknn-toolkit2 转换, target=rv1126b) |
+| 模型转换 | `rknn_model_zoo/examples/yolov8/python/convert.py yolov8n.onnx rv1126b fp` |
+| 日志 | producer 日志: `[detect] N 个目标: c0@0.62 ...` (c0=person) |
+| 阈值 | conf 0.25 / NMS 0.45 (官方默认; 定焦+距离导致分数偏低, 勿用 0.45) |
+| 推理频率 | 1080p 采集 15fps → 每 3 帧 1 次 ≈ 5fps |
+
+**取帧方式**: 直接挂在 producer 采集帧上 (NV12 直喂), 不走
+RTSP/MPP 解码 — 板上第二路 mppvideodec 起不来 (buffer 协商失败),
+这是绕开它的正解 (与社区 RKMedia VI 直采同理)。
+
+**关键实现约束** (踩坑记录):
+- rknn_outputs 必须设置 `index` (全 0 输出错乱 → 恒 0 检测)
+- 每次推理前必须调用 `rknn_inputs_set` (漏掉推理的是旧输入)
+- 模型缺失时 detect_init 失败仅告警, 不阻塞推流
+
 ## 7. 常见问题排查
 
 | 症状 | 原因 | 解决 |

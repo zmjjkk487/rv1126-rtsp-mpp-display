@@ -35,6 +35,8 @@ RTSP 服务器、RTP 分包、ONVIF 协议栈**全部从零手写**（不依赖 
 - 🎛️ **Web 管理平台**（Rust/axum）：ONVIF 自动发现摄像头、一键连接上屏、浏览器 HLS/MJPEG 预览、登录认证
 - 🎥 **云台控制 (ONVIF PTZ)**：ContinuousMove 方向控制 + SetPreset/GotoPreset 预置位管理；
   本机无云台 → 屏幕箭头/预置位标识可视化验证，真实云台换回调实现即可
+- 🤖 **NPU 人形检测**：板载 NPU (rknpu) 跑 yolov8n，挂在 producer 采集帧上
+  （每 3 帧推理一次），检测到人实时打印；推理与 MPP 编解码完全独立
 - 🛡️ **自愈守护**：producer 崩溃看门狗 + 显示帧看门狗（解码器卡死自动重启），开机自启
 - 📊 **真机验证**：全部功能在 ATK-DLRV1126B 实板跑通，含帧率测量脚本（measure_streams.py）
 

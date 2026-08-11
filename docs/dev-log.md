@@ -697,3 +697,46 @@ GST_DEBUG_BIN_TO_DOT_FILE=1 ./rv1126_gst_display
 - 预置位存储: 内存 (最多 8 个, token|name), producer 重启丢失 —
   产品化需持久化 flash 并保存电机位置
 - 屏幕叠加走 fb 层而非解码层: 嵌入式显示叠加的正确姿势
+
+---
+
+## 13. NPU 人形检测开发记录 — 2026-08-11
+
+### 需求
+RV1126B 是 AI 芯片 (板载 NPU 2 TOPS), C 端产品核心卖点: 人形检测。
+摄像头画面检测到人 → 输出结果, 为后续报警/推送打基础。
+
+### 架构 (社区正解, 绕开大坑)
+```
+producer 采集 NV12 → 每 3 帧 detect_feed → 检测线程:
+  NV12 → letterbox RGB640 → rknn_inputs_set → rknn_run
+  → rknn_outputs_get → 官方 post_process → 结果共享/打印
+```
+推理全程 NPU, 与 MPP 编解码独立。取帧挂在 producer 采集帧上,
+**不走 RTSP/MPP 解码** — 板上第二路 mppvideodec 起不来 (mpp_buf_slot
+mismatch, buffer 协商失败, 显示端在跑时更明显), 绕开即正解。
+
+### 工具链 (RV1126B 专属)
+- 模型转换: rknn-toolkit2 2.3.2, target 平台名是 **rv1126b** (不是 rv1126!)
+- 1.7.x 老 toolkit 不支持 (wheel 只到 cp38 + 依赖 TF 1.14, 死路)
+- 模型: yolov8n.onnx → rknn (fp; INT8 量化需校准数据集, 可到 53fps)
+
+### 踩坑 (按发现顺序, 全部沉淀)
+1. **rknn_outputs 必须设 index=i** — 全 0 时 outputs_get 结果错乱
+   (want_float=1 输出 score 全 0.02x, 与模拟器 1.0 不符)
+2. **每次推理前必须 rknn_inputs_set** — 漏掉则 rknn_run 用旧输入,
+   恒 0 检测。这是卡最久的根因
+3. **置信度阈值 0.45→0.25** — 定焦镜头 + 距离让检测分数偏低
+   (0.27-0.7 波动), 官方默认 BOX_THRESH 就是 0.25
+4. **PC 模拟器 ≠ 板端 NPU** — 模拟器 score=1.0 的帧, 板端只有 0.05;
+   以板端实测为准, 模拟器只用来验证输入图像正确性
+5. 第二路 mppvideodec 起不来 — 绕开 (采集帧直喂), 不硬刚
+
+### 结果
+人在摄像头前 → `[detect] 1 个目标: c0@0.62` (c0=person), 稳定检测。
+误检少量 (c15/c16/c28 等, 背景干扰), 产品化可只关注 c0 并提高 NMS。
+
+### 后续方向
+- INT8 量化模型 (53fps, 需 COCO 校准集)
+- 检测结果接 web 页面/报警推送
+- 只保留 person 类的后处理过滤 (误检清零)
