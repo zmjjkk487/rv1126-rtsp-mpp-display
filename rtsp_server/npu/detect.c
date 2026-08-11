@@ -70,48 +70,59 @@ static void *detect_thread(void *arg) {
     inputs[0].size = MODEL_SIZE * MODEL_SIZE * 3;
     inputs[0].buf = rgb;
 
+    /* 必须清零: outputs[9] 是栈数组, buf 字段的垃圾值会误导 SDK
+     * (code-review 发现: 未初始化的 buf 让 outputs_get 结果错乱) */
+    memset(outputs, 0, sizeof outputs);
     for (uint32_t i = 0; i < g_app.io_num.n_output; i++) {
         outputs[i].index = i;                  /* 必须设置 index */
         outputs[i].want_float = 1;             /* fp 模型直接转 float */
     }
 
     while (g_run) {
+        int w, h, hs;
+        uint8_t *frame;
         pthread_mutex_lock(&g_feed_lock);
         while (!g_frame_ready && g_run)
             pthread_cond_wait(&g_feed_cv, &g_feed_lock);
         if (!g_run) { pthread_mutex_unlock(&g_feed_lock); break; }
-        int w = g_frame_w, h = g_frame_h, hs = g_frame_hs;
-        uint8_t *frame = g_frame;
+        w = g_frame_w; h = g_frame_h; hs = g_frame_hs;
+        frame = g_frame;
         g_frame_ready = 0;
-        pthread_mutex_unlock(&g_feed_lock);
-
+        /* 锁内完成 letterbox 读取: feed 的 3MB memcpy 不会撕裂本帧 */
         nv12_letterbox_rgb(frame, frame + (size_t)w * h, w, h, hs, rgb);
+        pthread_mutex_unlock(&g_feed_lock);
 
         /* 关键: 每次推理前必须 rknn_inputs_set 把当前帧交给 rknn —
          * 漏掉会推理旧输入 → 恒 0 检测 (踩坑) */
         if (rknn_inputs_set(g_app.rknn_ctx, 1, inputs) != RKNN_SUCC) {
             fprintf(stderr, "[detect] inputs_set 失败\n");
+            rknn_outputs_release(g_app.rknn_ctx, g_app.io_num.n_output,
+                                 outputs);
             continue;
         }
         if (rknn_run(g_app.rknn_ctx, NULL) != RKNN_SUCC) {
             fprintf(stderr, "[detect] rknn_run 失败\n");
+            rknn_outputs_release(g_app.rknn_ctx, g_app.io_num.n_output,
+                                 outputs);
             continue;
         }
         if (rknn_outputs_get(g_app.rknn_ctx, g_app.io_num.n_output,
                              outputs, NULL) != RKNN_SUCC) {
             fprintf(stderr, "[detect] outputs_get 失败\n");
+            rknn_outputs_release(g_app.rknn_ctx, g_app.io_num.n_output,
+                                 outputs);
             continue;
         }
 
         letterbox_t lb = { 0, 0, 1.0f };
-        /* 框坐标需映射回源帧: lb.scale 用 nw/(640)... 简化: 检测线程
-         * 用与 letterbox 相同的缩放比例反算 — 但 post_process 的
-         * letterbox 参数需要 x_pad/y_pad/scale, 这里重建 */
+        /* 坐标反映射: post_process 的 box = (model - pad) / scale,
+         * scale 必须是源→模型的缩放系数 k (1080p 时 = 1/3) —
+         * 注意不是 1/k: 除以 1/k 等于乘 k, 框会缩小 k² 倍 (踩坑) */
         float k = fminf((float)MODEL_SIZE / w, (float)MODEL_SIZE / h);
         int nw = (int)(w * k), nh = (int)(h * k);
         lb.x_pad = (MODEL_SIZE - nw) / 2;
         lb.y_pad = (MODEL_SIZE - nh) / 2;
-        lb.scale = (float)MODEL_SIZE / nw;
+        lb.scale = (float)nw / w;   /* = k: 模型坐标 → 源帧坐标 */
 
         object_detect_result_list od;
         memset(&od, 0, sizeof od);
@@ -144,6 +155,13 @@ int detect_init(const char *model_path) {
     if (rknn_query(g_app.rknn_ctx, RKNN_QUERY_IN_OUT_NUM, &g_app.io_num,
                    sizeof g_app.io_num) != RKNN_SUCC) {
         fprintf(stderr, "[detect] 查询 IO 失败\n");
+        return -1;
+    }
+    if (g_app.io_num.n_output > 9) {
+        /* 检测线程 outputs[9] 固定数组 + post_process 按 3 路/分支 —
+         * 只支持 yolov8n 转换后的 9 路输出, 换模型需同步改 */
+        fprintf(stderr, "[detect] 模型输出 %u 路, 超出支持上限 9 (yolov8n)\n",
+                g_app.io_num.n_output);
         return -1;
     }
     g_app.input_attrs = (rknn_tensor_attr *)calloc(g_app.io_num.n_input,
