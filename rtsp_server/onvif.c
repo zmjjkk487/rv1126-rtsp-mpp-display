@@ -938,8 +938,9 @@ static void *http_thread(void *arg) {
         int cfd = accept(fd, NULL, NULL);
         if (cfd < 0) continue;
 
-        /* 5s 超时: 半开连接/慢客户端不挂死整个 HTTP 服务 */
-        struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+        /* 500ms 超时: 单线程 accept, PTZ 等控制指令不能被慢连接拖住
+         * (用户实测: 慢连接会拖出 1-2 秒的按钮卡顿) */
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 500000 };
         setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
 
         /* 读请求头直到空行 (没读到空行一律关闭: 半头/超时/EOF

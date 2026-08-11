@@ -28,9 +28,11 @@ void fb_deinit(fb_t *f);
  * y_vstride: 源帧垂直 stride (MPP ver_stride, 行数, 可能 > src_h)
  *            必须原样传给 RGA, 否则 1080p 会 UV 偏移错位
  * par_n/par_d: 像素宽高比 (SAR). PAL 704×576 通常按 4:3 (12:11),
- *            流无 SAR 元数据时必须由调用方按惯例传入, 否则画面变形 */
+ *            流无 SAR 元数据时必须由调用方按惯例传入, 否则画面变形
+ * arrow_dir: PTZ 箭头叠加 0=无 1=左 2=右 — 画在 back 缓冲 (视频区中心),
+ *            不碰解码 DMABUF (写 DMABUF 会破坏 DMA 一致性 → IOMMU 页错误卡死) */
 void fb_show_nv12(fb_t *f, const uint8_t *y, const uint8_t *uv, int src_w,
                   int src_h, int y_stride, int y_vstride,
-                  int par_n, int par_d);
+                  int par_n, int par_d, int arrow_dir);
 
 #endif

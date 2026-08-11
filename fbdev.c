@@ -152,8 +152,42 @@ static void scale_nv12_nearest(const uint8_t *y, const uint8_t *uv, int sw,
     }
 }
 
+/* ---------------- PTZ 箭头叠加 (BGRX back 缓冲) ----------------
+ * 画在 RGA 转换后的 back 上 (我们自己的内存), 不碰解码 DMABUF —
+ * 写 DMABUF 会破坏 DMA 一致性 → IOMMU 页错误 → 解码器挂死 (实测) */
+
+/* 点是否在三角形内 (半平面测试, 整数运算) */
+static int pt_in_tri(int px, int py, int x0, int y0, int x1, int y1,
+                     int x2, int y2) {
+    int d1 = (px - x0) * (y1 - y0) - (py - y0) * (x1 - x0);
+    int d2 = (px - x1) * (y2 - y1) - (py - y1) * (x2 - x1);
+    int d3 = (px - x2) * (y0 - y2) - (py - y2) * (x0 - x2);
+    return !((d1 < 0) || (d2 < 0) || (d3 < 0)) ||
+           !((d1 > 0) || (d2 > 0) || (d3 > 0));
+}
+
+/* 在 BGRX 缓冲 (行宽 lw 像素) 的 (cx,cy) 中心画 160x160 红色箭头 */
+static void draw_arrow_bgrx(uint32_t *pix, int lw, int cx, int cy, int left) {
+    const int B = 160;
+    int ax = cx - B / 2, ay = cy - B / 2;
+    for (int py = 0; py < B; py++) {
+        for (int px = 0; px < B; px++) {
+            /* 右箭头: 三角 (指向右) + 尾杆; left 时镜像 */
+            int inside = pt_in_tri(px, py, 12, 12, B - 12, B / 2, 12, B - 12) ||
+                         (px >= 12 && px <= B / 2 &&
+                          py >= B / 2 - 15 && py <= B / 2 + 15);
+            if (!inside) continue;
+            int xx = ax + (left ? (B - 1 - px) : px);
+            int yy = ay + py;
+            if (xx < 0 || yy < 0 || xx >= lw) continue;
+            pix[yy * lw + xx] = 0x00FF0000;   /* BGRX: R=255 亮红 */
+        }
+    }
+}
+
 void fb_show_nv12(fb_t *f, const uint8_t *y, const uint8_t *uv, int sw, int sh,
-                  int y_stride, int y_vstride, int par_n, int par_d) {
+                  int y_stride, int y_vstride, int par_n, int par_d,
+                  int arrow_dir) {
     if (!f->mem || !f->back)
         return;
     f->frame_nr++;
@@ -237,6 +271,13 @@ void fb_show_nv12(fb_t *f, const uint8_t *y, const uint8_t *uv, int sw, int sh,
     }
 
 write_fb:
+    /* PTZ 箭头叠加: 视频区中心, 画在 back (自己的内存), 再随帧写显存。
+     * 必须放这里 — RGA 成功路径会 goto write_fb 跳过上面的代码 */
+    if (arrow_dir) {
+        int cx = xoff + vw / 2, cy = yoff + vh / 2;
+        draw_arrow_bgrx((uint32_t *)f->back, (int)f->w, cx, cy,
+                        arrow_dir == 1);
+    }
     /* 写显存 — 处理 16bpp 和 32bpp 两种格式 */
     if (f->bpp == 16) {
         uint16_t *d = (uint16_t *)f->mem;

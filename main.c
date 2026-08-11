@@ -180,44 +180,11 @@ static void ptz_indicator_update(void) {
             ptz_left = (strcmp(dir, "LEFT") == 0);
             ptz_until = (int64_t)ts + 3000000;   /* 显示 3 秒 */
         }
+        fprintf(stderr, "[ptz] 读取: dir=%s ts=%lld now=%lld → until=%lld\n",
+               dir, ts, (long long)g_get_monotonic_time(),
+               (long long)ptz_until);
     }
     fclose(f);
-}
-
-/* 点是否在三角形内 (半平面测试, 整数运算, 无浮点) */
-static int pt_in_tri(int px, int py, int x0, int y0, int x1, int y1,
-                     int x2, int y2) {
-    int d1 = (px - x0) * (y1 - y0) - (py - y0) * (x1 - x0);
-    int d2 = (px - x1) * (y2 - y1) - (py - y1) * (x2 - x1);
-    int d3 = (px - x2) * (y0 - y2) - (py - y2) * (x0 - x2);
-    return !((d1 < 0) || (d2 < 0) || (d3 < 0)) ||
-           !((d1 > 0) || (d2 > 0) || (d3 > 0));
-}
-
-/* 在 NV12 帧顶部画一个大箭头 (亮红), left=1 指向左, 否则向右 */
-static void draw_ptz_arrow(uint8_t *y, uint8_t *uv, int w, int h, int hs,
-                           int left) {
-    const int B = 160;                     /* 箭头盒边长 */
-    int ax = (w - B) / 2, ay = 20;
-    const uint8_t YV = 150, UV = 90, VV = 240;   /* 亮红 (NV12 色度) */
-    for (int py = 0; py < B; py++) {
-        for (int px = 0; px < B; px++) {
-            /* 盒坐标 → 屏幕坐标 (left 时镜像 → 箭头反向) */
-            int xx = left ? (ax + B - 1 - px) : (ax + px);
-            int yy = ay + py;
-            if (xx < 0 || xx >= w || yy >= h) continue;
-            /* 右箭头: 三角 (指向右) + 尾杆 */
-            int inside = pt_in_tri(px, py, 12, 12, B - 12, B / 2, 12, B - 12) ||
-                         (px >= 12 && px <= B / 2 &&
-                          py >= B / 2 - 15 && py <= B / 2 + 15);
-            if (!inside) continue;
-            y[yy * hs + xx] = YV;
-            /* NV12 色度: 每 2x2 像素共享一对 U/V, 行距 = hs 字节 */
-            size_t up = (size_t)(yy / 2) * hs + (size_t)(xx / 2) * 2;
-            uv[up] = UV;
-            uv[up + 1] = VV;
-        }
-    }
 }
 
 /* appsink 回调: 收到 NV12 帧 → RGA 硬转 + fbdev 直写 */
@@ -308,13 +275,16 @@ static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer data) {
         par_d = 11;
     }
 
-    /* PTZ 屏幕标识: producer 收到云台指令后 3 秒内画箭头 (证明收到指令) */
+    /* PTZ 屏幕标识: producer 收到云台指令后 3 秒内画箭头 (证明收到指令)
+     * 箭头画在 fbdev 的 back 缓冲 (fb_show_nv12 内), 不碰解码 DMABUF —
+     * 写 DMABUF 破坏 DMA 一致性 → IOMMU 页错误 → 解码器挂死 (实测) */
+    int arrow_dir = 0;
     if (frame_count % 5 == 0)
         ptz_indicator_update();
     if (ptz_until > 0 && g_get_monotonic_time() < ptz_until)
-        draw_ptz_arrow((uint8_t *)y, (uint8_t *)uv, w, h, hs, ptz_left);
+        arrow_dir = ptz_left ? 1 : 2;
 
-    fb_show_nv12(&g_fb, y, uv, w, h, hs, vs, par_n, par_d);
+    fb_show_nv12(&g_fb, y, uv, w, h, hs, vs, par_n, par_d, arrow_dir);
 
     gst_buffer_unmap(buf, &map);
     gst_sample_unref(sample);
@@ -351,6 +321,27 @@ static void log_redacted_url(const config_t *cfg) {
         q = end;                          /* 继续扫描后续参数 */
     }
     LOGI("RTSP: %s", safe);
+}
+
+/* 帧看门狗: alientek MPP 解码器偶发卡死 (mpp_buf_slot mismatch 重配循环,
+ * 供应商 bug 无法根治) — 6 秒无新帧 → 退出进程, S99camera 看门狗拉起自愈 */
+static void *frame_watchdog(void *arg) {
+    (void)arg;
+    int last = 0, stale = 0;
+    for (;;) {
+        sleep(3);
+        if (frame_count == last) {
+            if (++stale >= 2) {
+                fprintf(stderr, "[watchdog] 6 秒无新帧 (解码器卡死), 退出重启\n");
+                fflush(stderr);
+                exit(1);
+            }
+        } else {
+            stale = 0;
+            last = frame_count;
+        }
+    }
+    return NULL;
 }
 
 /* 信号处理 */
@@ -508,6 +499,9 @@ int main(int argc, char *argv[]) {
     }
 
     LOGI("管道运行中, Ctrl+C 退出");
+    /* 帧看门狗: 解码器卡死自愈 (6 秒无帧退出, S99camera 拉起) */
+    pthread_t wd;
+    pthread_create(&wd, NULL, frame_watchdog, NULL);
     g_loop = g_main_loop_new(NULL, FALSE);
     g_main_loop_run(g_loop);
 

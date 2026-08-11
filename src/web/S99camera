@@ -49,11 +49,10 @@ start)
         sleep 15
         # Web 后台掉了 (按端口检查, 避免 pidof 误判僵尸进程)
         ss -tlnp 2>/dev/null | grep -q ":$WEB_PORT" || start_web
-        # 管线掉了且有已保存的连接 → 重启 web 触发自动恢复
+        # 显示管线掉了 → 直接拉起 (自身带帧看门狗, 解码器卡死会退出)
         pidof rtsp_display >/dev/null 2>&1 || {
-            [ -f /root/last_connect.json ] && {
-                start_web
-            }
+            echo "  rtsp_display 掉了, 直接拉起"
+            cd /root && setsid nohup ./rtsp_display ./config.ini </dev/null >/tmp/gst_web.log 2>&1 &
         }
     done ) &
     echo "  看门狗已启动"

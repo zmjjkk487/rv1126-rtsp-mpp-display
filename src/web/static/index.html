@@ -751,12 +751,11 @@ function stopPreview() {
 }
 
 /* === 云台控制: 按住转, 松开停 (ContinuousMove → Stop) === */
-/* 控制目标 = 当前预览的码流所属摄像头 (连接谁控制谁) */
+/* 控制目标 = 本机摄像头 (板子自己, 浏览器访问的地址):
+ * 指令必须到板子才会触发屏幕箭头; 跟随预览码流会把指令发到
+ * 海康 (无预览时回退 config.ini), 板子收不到指令 → 箭头不出现 */
 function ptzTargetIp() {
-  try {
-    let u = new URL(lastPreviewUrl);
-    return u.hostname || '';
-  } catch(e) { return ''; }
+  return window.location.hostname || '';
 }
 function ptzMove(dir) {
   apiFetch('/api/ptz', {

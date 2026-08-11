@@ -146,7 +146,7 @@ static int write_rtp(int fd, const uint8_t *buf, size_t n) {
 }
 
 /* TCP interleaved 帧: $ + channel + 2 字节大端长度 + RTP 包 */
-static void send_rtsp_frame(rtsp_session *s, const uint8_t *rtp, size_t n) {
+static int send_rtsp_frame(rtsp_session *s, const uint8_t *rtp, size_t n) {
     uint8_t hdr[4] = { 0x24, 0 /* channel 0 */,
                        (uint8_t)(n >> 8), (uint8_t)(n & 0xff) };
     int err = 0;
@@ -156,7 +156,9 @@ static void send_rtsp_frame(rtsp_session *s, const uint8_t *rtp, size_t n) {
         s->drops++;
         if (err != EAGAIN && err != EWOULDBLOCK)
             atomic_store(&s->state, ST_DEAD);   /* 真错误: 会话报废 */
+        return -1;
     }
+    return 0;
 }
 
 /* ---------------- RTP 打包 ---------------- */
@@ -198,7 +200,8 @@ static void send_fua(rtsp_session *s, const uint8_t *nal, size_t len) {
         pkt[12] = fu_ind;
         pkt[13] = (uint8_t)((first ? 0x80 : 0) | (last ? 0x40 : 0) | type);
         memcpy(pkt + 14, nal + off, chunk);
-        send_rtsp_frame(s, pkt, 14 + chunk);
+        if (send_rtsp_frame(s, pkt, 14 + chunk) < 0)
+            break;   /* 中途失败: 丢弃剩余分片, 不产生半截 NAL (防花屏) */
 
         off += chunk;
         first = 0;
@@ -453,7 +456,9 @@ static int handle_request(rtsp_session *s, const char *req) {
             printf("[RTSP] 未知路径 \"%s\" → 404\n", path);
             return rtsp_reply(s, cseq, "404 Not Found", NULL, NULL);
         }
-        s->mount = m;   /* 会话绑定到挂载点: 只收该码流的 feed */
+        s->mount = m; 
+        
+        /* 会话绑定到挂载点: 只收该码流的 feed */
         /* 只支持 TCP interleaved, 无论客户端请求什么, 都回交错通道 */
         snprintf(s->session_id, sizeof s->session_id, "rv1126-%08x", s->ssrc);
         char extra[384];
@@ -667,6 +672,10 @@ void rtsp_server_feed_nal(rtsp_mount_t *mount, const uint8_t *nal, size_t len) {
         pthread_mutex_lock(&s->send_lock);
         if (type == 1 || type == 5)          /* 每帧推进 RTP 时间戳 */
             s->ts += step;
+        /* 注意: 不要发送前 poll 检查可写性 — 客户端解码器初始化时
+         * 还没开始读 RTP, socket 满会误判为"慢客户端"整帧丢弃,
+         * 连 SPS/PPS 都丢 → 解码器永远无法初始化 → 启动卡死。
+         * 花屏防护只在 send_fua 中途失败时 break (不留半截 NAL) */
         if (len <= MAX_PAYLOAD)
             send_single(s, nal, len);
         else
