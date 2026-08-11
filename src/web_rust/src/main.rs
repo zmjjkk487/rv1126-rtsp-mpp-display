@@ -24,7 +24,6 @@ use tokio::sync::Mutex;
 const STATIC_DIR: &str = "/root/camera-web/static";
 const PASSWD_FILE: &str = "/root/camera-web/passwd";
 const CREDS_FILE: &str = "/root/camera-web/creds";
-const DEVICES_FILE: &str = "/root/camera-web/devices.json";
 const DEFAULT_HASH: &str =
     "240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9";
 
@@ -34,25 +33,6 @@ struct AppState {
     pw_hash: Mutex<String>,
     sessions: Mutex<HashMap<String, u64>>,   // token → expiry timestamp
     login_fails: Mutex<Vec<u64>>,
-    devices: Mutex<Vec<DeviceEntry>>,        // 已保存摄像头列表
-}
-
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct DeviceEntry {
-    id: String,
-    name: String,
-    ip: String,
-    rtsp_url: String,
-    user: String,
-    pass: String,
-    added_at: String,
-}
-
-#[derive(Clone, serde::Serialize)]
-struct DeviceStatus {
-    #[serde(flatten)]
-    device: DeviceEntry,
-    online: bool,
 }
 
 // ─── JSON Types ─────────────────────────────────────────────
@@ -61,45 +41,6 @@ struct DeviceStatus {
 struct LoginReq {
     user: Option<String>,
     pass: Option<String>,
-}
-
-#[derive(Serialize)]
-struct LoginResp {
-    status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    token: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ConnectReq {
-    url: Option<String>,
-    #[serde(default)]
-    user: Option<String>,
-    #[serde(default)]
-    pass: Option<String>,
-}
-
-#[derive(Serialize)]
-struct ConnectResp {
-    status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pid: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    rtsp: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct HlsReq {
-    url: Option<String>,
-}
-
-#[derive(Serialize)]
-struct HlsStartResp {
-    status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    hls_token: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -143,14 +84,6 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-fn parse_bearer(req: &axum::http::Request<axum::body::Body>) -> Option<String> {
-    req.headers()
-        .get(header::AUTHORIZATION)?
-        .to_str()
-        .ok()
-        .and_then(|v| v.strip_prefix("Bearer ").map(|t| t.to_string()))
 }
 
 // ─── ONVIF WS-Discovery ─────────────────────────────────────
@@ -487,6 +420,8 @@ async fn get_video_source_token(ip: &str, user: &str, pass: &str) -> String {
 }
 
 /// 读取当前 IRCUT 状态 (ONVIF GetImagingSettings → IrCutFilter)
+/// 预留: handle_ircut 目前只调用设置侧, 读取状态供前端展示时启用
+#[allow(dead_code)]
 async fn onvif_get_ircut(ip: &str, user: &str, pass: &str) -> Option<String> {
     let token = get_video_source_token(ip, user, pass).await;
     let body = format!(
@@ -612,20 +547,17 @@ fn inject_creds(url: &str) -> String {
     url.to_string()
 }
 
-/// HLS 转码子进程 pid (精确管理: 不用 killall 误杀预览转码, 修复互踩;
+/// HLS 转码子进程 (精确管理: 不用 killall 误杀预览转码, 修复互踩;
 /// spawn 不后台化, web 崩溃后不再留孤儿 gst-launch)
-static HLS_CHILD: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);
+static HLS_CHILD: std::sync::Mutex<Option<std::process::Child>> =
+    std::sync::Mutex::new(None);
 
-/// 精确 kill HLS 转码进程 (只杀自己的, 不动预览)
+/// 精确 kill HLS 转码进程 (只杀自己的, 不动预览; wait 回收防僵尸)
 async fn kill_hls_child() {
-    /* 先 take 再 await: if-let 里的 MutexGuard 临时值存活到语句结束,
-     * 体内 await 会让 future 非 Send → axum Handler 不满足 (踩坑) */
-    let pid = HLS_CHILD.lock().unwrap().take();
-    if let Some(pid) = pid {
-        let _ = Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .output()
-            .await;
+    if let Some(mut c) = HLS_CHILD.lock().unwrap().take() {
+        /* kill + wait 均为同步调用, 锁不跨 await 点 (future 保持 Send) */
+        let _ = c.kill();
+        let _ = c.wait();
     }
 }
 
@@ -679,7 +611,7 @@ async fn hls_start(url: &str) -> (String, String) {
     }
     match spawn.spawn() {
         Ok(c) => {
-            *HLS_CHILD.lock().unwrap() = Some(c.id());
+            *HLS_CHILD.lock().unwrap() = Some(c);
         }
         Err(e) => {
             eprintln!("hls_start spawn 失败: {e}");
@@ -846,6 +778,9 @@ async fn handle_login(
         return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({"error":"too many attempts, try later"}))).into_response();
     }
 
+    /* 单管理员系统: 用户名固定, 只校验密码 (安全扫描 W-05 记录 —
+     * 忽略 user 是已知语义, 引入账号体系时再修) */
+    let _ = &req.user;
     let pass = req.pass.unwrap_or_default();
     if pass.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"missing password"}))).into_response();
@@ -1858,7 +1793,6 @@ async fn main() {
         pw_hash: Mutex::new(pw_hash),
         sessions: Mutex::new(HashMap::new()),
         login_fails: Mutex::new(Vec::new()),
-        devices: Mutex::new(Vec::new()),
     });
 
     // Auto-recover last camera
