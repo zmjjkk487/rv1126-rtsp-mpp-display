@@ -166,6 +166,40 @@ static int pt_in_tri(int px, int py, int x0, int y0, int x1, int y1,
            !((d1 > 0) || (d2 > 0) || (d3 > 0));
 }
 
+/* 5x7 位图字体: '0'-'9' 与 'P' (每行 5 bit, bit4=最左列) */
+static const uint8_t FONT_DIGITS[11][7] = {
+    {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E},   /* 0 */
+    {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E},   /* 1 */
+    {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F},   /* 2 */
+    {0x1F,0x02,0x04,0x02,0x01,0x11,0x0E},   /* 3 */
+    {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02},   /* 4 */
+    {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E},   /* 5 */
+    {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E},   /* 6 */
+    {0x1F,0x01,0x02,0x04,0x08,0x08,0x08},   /* 7 */
+    {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E},   /* 8 */
+    {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C},   /* 9 */
+    {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10},   /* P */
+};
+
+/* 在 BGRX 缓冲 (行宽 lw) 的 (cx,cy) 画红色文本 (5x7 字体, 字符间隔 1px) */
+static void draw_text_bgrx(uint32_t *pix, int lw, int cx, int cy,
+                           const char *s) {
+    int x = cx - (int)strlen(s) * 6 / 2;   /* 水平居中 */
+    for (const char *c = s; *c; c++) {
+        int idx = (*c >= '0' && *c <= '9') ? *c - '0' : 10;   /* P */
+        for (int row = 0; row < 7; row++) {
+            uint8_t bits = FONT_DIGITS[idx][row];
+            for (int col = 0; col < 5; col++) {
+                if (!(bits & (1 << (4 - col)))) continue;
+                int xx = x + col, yy = cy + row - 3;
+                if (xx < 0 || yy < 0 || xx >= lw) continue;
+                pix[yy * lw + xx] = 0x00FF0000;
+            }
+        }
+        x += 6;
+    }
+}
+
 /* 在 BGRX 缓冲 (行宽 lw 像素) 的 (cx,cy) 中心画 160x160 红色箭头 */
 static void draw_arrow_bgrx(uint32_t *pix, int lw, int cx, int cy, int left) {
     const int B = 160;
@@ -187,7 +221,7 @@ static void draw_arrow_bgrx(uint32_t *pix, int lw, int cx, int cy, int left) {
 
 void fb_show_nv12(fb_t *f, const uint8_t *y, const uint8_t *uv, int sw, int sh,
                   int y_stride, int y_vstride, int par_n, int par_d,
-                  int arrow_dir) {
+                  int arrow_dir, const char *preset_label) {
     if (!f->mem || !f->back)
         return;
     f->frame_nr++;
@@ -271,12 +305,16 @@ void fb_show_nv12(fb_t *f, const uint8_t *y, const uint8_t *uv, int sw, int sh,
     }
 
 write_fb:
-    /* PTZ 箭头叠加: 视频区中心, 画在 back (自己的内存), 再随帧写显存。
+    /* PTZ 叠加: 视频区中心, 画在 back (自己的内存), 再随帧写显存。
      * 必须放这里 — RGA 成功路径会 goto write_fb 跳过上面的代码 */
     if (arrow_dir) {
         int cx = xoff + vw / 2, cy = yoff + vh / 2;
         draw_arrow_bgrx((uint32_t *)f->back, (int)f->w, cx, cy,
                         arrow_dir == 1);
+    }
+    if (preset_label[0]) {
+        int cx = xoff + vw / 2, cy = yoff + vh / 2;
+        draw_text_bgrx((uint32_t *)f->back, (int)f->w, cx, cy, preset_label);
     }
     /* 写显存 — 处理 16bpp 和 32bpp 两种格式 */
     if (f->bpp == 16) {

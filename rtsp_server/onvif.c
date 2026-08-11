@@ -47,6 +47,10 @@ struct onvif_server {
     void *jpeg_ctx;
     ptz_cb_fn ptz_cb;              /* PTZ 指令回调 (接受指令后调用) */
     void *ptz_ctx;
+    ptz_preset_cb_fn preset_cb;    /* 预置位回调 (Set/Goto 接受后调用) */
+    void *preset_ctx;
+    char presets[8][40];           /* 预置位表: "token|name" (最多 8 个) */
+    int preset_count;
     pthread_t ws_tid, http_tid;
 };
 
@@ -568,6 +572,87 @@ static void hdr_ptz_stop(onvif_server_t *o, char *out, size_t cap) {
     snprintf(out, cap, "<tptz:StopResponse/>\n");
 }
 
+/* SetPreset: 保存预置位 (token|name), 接受后回调 */
+static void hdr_ptz_set_preset(onvif_server_t *o, const char *req,
+                               char *out, size_t cap) {
+    char token[32] = "", name[32] = "";
+    xml_extract(req, "tptz:PresetToken", token, sizeof token) != 0 &&
+        xml_extract(req, "PresetToken", token, sizeof token);
+    xml_extract(req, "tptz:PresetName", name, sizeof name) != 0 &&
+        xml_extract(req, "PresetName", name, sizeof name);
+    if (!token[0]) {
+        snprintf(out, cap, "<tptz:SetPresetResponse/>\n");
+        return;
+    }
+    /* 更新或追加 (上限 8 个) */
+    int found = -1;
+    for (int i = 0; i < o->preset_count; i++)
+        if (strncmp(o->presets[i], token, strlen(token)) == 0) { found = i; break; }
+    if (found < 0 && o->preset_count < 8)
+        found = o->preset_count++;
+    if (found >= 0)
+        snprintf(o->presets[found], sizeof o->presets[0], "%s|%s",
+                 token, name[0] ? name : token);
+    if (o->preset_cb)
+        o->preset_cb(token, 0, o->preset_ctx);   /* 接受指令后的回调 */
+    snprintf(out, cap,
+             "<tptz:SetPresetResponse><tptz:PresetToken>%s</tptz:PresetToken>"
+             "</tptz:SetPresetResponse>\n", token);
+}
+
+/* GotoPreset: 调用预置位, 接受后回调 */
+static void hdr_ptz_goto_preset(onvif_server_t *o, const char *req,
+                                char *out, size_t cap) {
+    char token[32] = "";
+    xml_extract(req, "tptz:PresetToken", token, sizeof token) != 0 &&
+        xml_extract(req, "PresetToken", token, sizeof token);
+    if (o->preset_cb)
+        o->preset_cb(token[0] ? token : "?", 1, o->preset_ctx);
+    snprintf(out, cap, "<tptz:GotoPresetResponse/>\n");
+}
+
+/* GetPresets: 返回已保存的预置位列表 (管理工具/ODM 用) */
+static void hdr_ptz_get_presets(onvif_server_t *o, char *out, size_t cap) {
+    char list[1024] = "";
+    size_t used = 0;
+    for (int i = 0; i < o->preset_count; i++) {
+        char *sep = strchr(o->presets[i], '|');
+        const char *name = sep ? sep + 1 : o->presets[i];
+        char token[40];
+        size_t tl = sep ? (size_t)(sep - o->presets[i]) : strlen(o->presets[i]);
+        if (tl >= sizeof token) tl = sizeof token - 1;
+        memcpy(token, o->presets[i], tl);
+        token[tl] = '\0';
+        int n = snprintf(list + used, sizeof list - used,
+                         "<tptz:Preset><tptz:PresetToken>%s</tptz:PresetToken>"
+                         "<tptz:PresetName>%s</tptz:PresetName></tptz:Preset>",
+                         token, name);
+        if (n <= 0 || used + (size_t)n >= sizeof list) break;
+        used += (size_t)n;
+    }
+    snprintf(out, cap, "<tptz:GetPresetsResponse>%s</tptz:GetPresetsResponse>\n",
+             list);
+}
+
+/* RemovePreset: 删除预置位 */
+static void hdr_ptz_remove_preset(onvif_server_t *o, const char *req,
+                                  char *out, size_t cap) {
+    char token[32] = "";
+    xml_extract(req, "tptz:PresetToken", token, sizeof token) != 0 &&
+        xml_extract(req, "PresetToken", token, sizeof token);
+    for (int i = 0; i < o->preset_count; i++) {
+        if (strncmp(o->presets[i], token, strlen(token)) == 0) {
+            for (int j = i; j < o->preset_count - 1; j++)
+                memcpy(o->presets[j], o->presets[j + 1], sizeof o->presets[0]);
+            o->preset_count--;
+            break;
+        }
+    }
+    if (o->preset_cb)
+        o->preset_cb(token, 2, o->preset_ctx);
+    snprintf(out, cap, "<tptz:RemovePresetResponse/>\n");
+}
+
 /* ---------------- MJPEG 低延迟预览 (GET /preview) ---------------- */
 
 /* 单调时钟微秒 (onvif.c 无 glib 依赖, 不能用 g_get_monotonic_time —
@@ -644,6 +729,10 @@ static void dispatch(onvif_server_t *o, const char *body, char *resp, size_t cap
     else if (strstr(body, "GetNetworkInterfaces")) m = "GetNetworkInterfaces";
     else if (strstr(body, "ContinuousMove")) m = "ContinuousMove";
     else if (strstr(body, "Stop>")) m = "PTZ Stop";
+    else if (strstr(body, "GetPresets")) m = "GetPresets";
+    else if (strstr(body, "SetPreset")) m = "SetPreset";
+    else if (strstr(body, "GotoPreset")) m = "GotoPreset";
+    else if (strstr(body, "RemovePreset")) m = "RemovePreset";
     else if (strstr(body, "GetSystemDateAndTime")) m = "GetSystemDateAndTime";
     else if (strstr(body, "GetCapabilities")) m = "GetCapabilities";
     else if (strstr(body, "GetServices")) m = "GetServices";
@@ -661,7 +750,15 @@ static void dispatch(onvif_server_t *o, const char *body, char *resp, size_t cap
     else if (strstr(body, "GetDeviceInformation")) m = "GetDeviceInformation";
     printf("[ONVIF] POST %s (%zu 字节)\n", m, strlen(body));
 
-    if (strstr(body, "ContinuousMove")) {
+    if (strstr(body, "GetPresets")) {
+        hdr_ptz_get_presets(o, body_xml, sizeof body_xml);
+    } else if (strstr(body, "SetPreset")) {
+        hdr_ptz_set_preset(o, body, body_xml, sizeof body_xml);
+    } else if (strstr(body, "GotoPreset")) {
+        hdr_ptz_goto_preset(o, body, body_xml, sizeof body_xml);
+    } else if (strstr(body, "RemovePreset")) {
+        hdr_ptz_remove_preset(o, body, body_xml, sizeof body_xml);
+    } else if (strstr(body, "ContinuousMove")) {
         hdr_ptz_continuous(o, body, body_xml, sizeof body_xml);
     } else if (strstr(body, "Stop>")) {
         hdr_ptz_stop(o, body_xml, sizeof body_xml);
@@ -1152,6 +1249,13 @@ void onvif_set_ptz_callback(onvif_server_t *o, ptz_cb_fn fn, void *ctx) {
     if (!o) return;
     o->ptz_cb = fn;
     o->ptz_ctx = ctx;
+}
+
+void onvif_set_ptz_preset_callback(onvif_server_t *o, ptz_preset_cb_fn fn,
+                                   void *ctx) {
+    if (!o) return;
+    o->preset_cb = fn;
+    o->preset_ctx = ctx;
 }
 
 int onvif_start(onvif_server_t *o) {

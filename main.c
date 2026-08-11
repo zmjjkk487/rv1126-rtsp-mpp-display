@@ -167,21 +167,37 @@ static void on_pad_added(GstElement *src, GstPad *pad, gpointer data) {
  * 3 秒内有效 → 在视频帧上画大箭头 — 证明摄像头确实收到指令 (本机无云台) */
 static int64_t ptz_until = 0;
 static int ptz_left = 0;
+static char ptz_label[32] = "";      /* 预置位文字 (PRESET 指令) */
 
 static void ptz_indicator_update(void) {
     FILE *f = fopen("/tmp/ptz_dir", "r");
     if (!f) { ptz_until = 0; return; }
     char dir[16] = "";
-    long long ts = 0;
-    if (fscanf(f, "%15s %lld", dir, &ts) == 2) {
-        if (strcmp(dir, "STOP") == 0) {
-            ptz_until = 0;                       /* STOP: 立即清除 */
+    if (fscanf(f, "%15s", dir) == 1) {
+        if (strcmp(dir, "PRESET") == 0) {
+            /* PRESET <token> <mode> <ts> — 显示预置位标识 */
+            char token[16] = "", mode[8] = "";
+            long long ts2 = 0;
+            if (fscanf(f, "%15s %7s %lld", token, mode, &ts2) == 3) {
+                snprintf(ptz_label, sizeof ptz_label, "%s%s", token,
+                         strcmp(mode, "set") == 0 ? "*" : "");
+                ptz_until = ts2 + 3000000;
+            }
         } else {
-            ptz_left = (strcmp(dir, "LEFT") == 0);
-            ptz_until = (int64_t)ts + 3000000;   /* 显示 3 秒 */
+            long long ts = 0;
+            if (fscanf(f, "%lld", &ts) == 1) {
+                if (strcmp(dir, "STOP") == 0) {
+                    ptz_until = 0;               /* STOP: 立即清除 */
+                    ptz_label[0] = '\0';
+                } else {
+                    ptz_left = (strcmp(dir, "LEFT") == 0);
+                    ptz_until = (int64_t)ts + 3000000;   /* 显示 3 秒 */
+                    ptz_label[0] = '\0';
+                }
+            }
         }
-        fprintf(stderr, "[ptz] 读取: dir=%s ts=%lld now=%lld → until=%lld\n",
-               dir, ts, (long long)g_get_monotonic_time(),
+        fprintf(stderr, "[ptz] 读取: dir=%s now=%lld → until=%lld\n",
+               dir, (long long)g_get_monotonic_time(),
                (long long)ptz_until);
     }
     fclose(f);
@@ -281,10 +297,15 @@ static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer data) {
     int arrow_dir = 0;
     if (frame_count % 5 == 0)
         ptz_indicator_update();
-    if (ptz_until > 0 && g_get_monotonic_time() < ptz_until)
-        arrow_dir = ptz_left ? 1 : 2;
+    if (ptz_until > 0 && g_get_monotonic_time() < ptz_until) {
+        if (!ptz_label[0])
+            arrow_dir = ptz_left ? 1 : 2;   /* 普通方向指令: 箭头 */
+    } else {
+        ptz_label[0] = '\0';   /* 过期: 预置位标签不再绘制 */
+    }
 
-    fb_show_nv12(&g_fb, y, uv, w, h, hs, vs, par_n, par_d, arrow_dir);
+    fb_show_nv12(&g_fb, y, uv, w, h, hs, vs, par_n, par_d, arrow_dir,
+                 ptz_label);
 
     gst_buffer_unmap(buf, &map);
     gst_sample_unref(sample);

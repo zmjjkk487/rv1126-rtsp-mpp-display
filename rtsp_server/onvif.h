@@ -54,6 +54,12 @@ typedef enum { PTZ_NONE = 0, PTZ_LEFT, PTZ_RIGHT, PTZ_STOP } ptz_dir_t;
 typedef void (*ptz_cb_fn)(ptz_dir_t dir, double speed, void *ctx);
 void onvif_set_ptz_callback(onvif_server_t *o, ptz_cb_fn fn, void *ctx);
 
+/* 云台预置位 (SetPreset/GotoPreset, ver20/ptz/wsdl):
+ * 接受指令后回调 token 与模式 (goto_mode=1 调用, 0 设置) */
+typedef void (*ptz_preset_cb_fn)(const char *token, int goto_mode, void *ctx);
+void onvif_set_ptz_preset_callback(onvif_server_t *o, ptz_preset_cb_fn fn,
+                                   void *ctx);
+
 /* 启动 UDP 3702 + HTTP :80 两个后台线程, 不阻塞 */
 int onvif_start(onvif_server_t *o);
 
