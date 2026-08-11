@@ -31,20 +31,74 @@ static int frame_count = 0;
 static fb_t g_fb;
 static config_t g_cfg;   /* 全局配置, 断线重连时重建管道用 */
 static int g_retry_delay = 2; /* 重连退避: 2s → 4s → 8s ... 封顶 30s */
+static guint g_bus_watch = 0;      /* 当前 bus watch id: 重建前先移除, 防泄漏 */
+static guint g_restart_source = 0; /* 排队的重启定时器 id: 非 0 即已有排队 */
 
-/* 前向声明 (restart_pipeline_cb 先于两者定义) */
+/* 前向声明 (restart_pipeline_cb 先于三者定义) */
 static GstElement *build_pipeline(const config_t *cfg);
 static gboolean on_bus_message(GstBus *bus, GstMessage *msg, gpointer data);
+static gboolean restart_pipeline_cb(gpointer data);
+
+/* 从凭据文件注入 user:pass@ 到 RTSP URL (不在 config.ini 暴露明文密码)。
+ * 重连时也必须调用: config_parse 会重置 URL, 不重新注入则 401 无限重连
+ * (M-12) */
+static void inject_creds(config_t *cfg) {
+    if (strstr(cfg->rtsp_url, "@"))
+        return;
+    FILE *cf = fopen("/root/camera-web/creds", "r");
+    if (!cf)
+        return;
+    char line[128];
+    if (fgets(line, sizeof(line), cf)) {
+        size_t l = strlen(line);
+        while (l > 0 && (line[l-1] == '\n' || line[l-1] == '\r')) line[--l] = '\0';
+        char *colon = strchr(line, ':');
+        /* 密码为空不注入: 让 URL 自带的 ?username=&password= 认证生效
+         * (海康 GetStreamUri 格式); 注入 admin:@ 空凭据反而 401 */
+        if (colon && colon[1] != '\0') {
+            *colon = '\0';
+            const char *proto = strstr(cfg->rtsp_url, "://");
+            if (proto) {
+                proto += 3;
+                char tmp[MAX_PATH];
+                snprintf(tmp, sizeof(tmp), "%.*s%s:%s@%s",
+                         (int)(proto - cfg->rtsp_url), cfg->rtsp_url,
+                         line, colon + 1, proto);
+                strncpy(cfg->rtsp_url, tmp, MAX_PATH - 1);
+                cfg->rtsp_url[MAX_PATH - 1] = '\0';
+            }
+        }
+    }
+    fclose(cf);
+}
+
+/* 排队一次重连 (去重: 已有排队则不再加, 防 EOS+ERROR 双重启) */
+static void schedule_restart(void) {
+    if (g_restart_source != 0)
+        return;
+    g_restart_source =
+        g_timeout_add_seconds(g_retry_delay, restart_pipeline_cb, NULL);
+}
 
 /* 断线重连: 销毁旧管道, 延时后重建 (在主循环线程执行) */
 static gboolean restart_pipeline_cb(gpointer data) {
     (void)data;
+    g_restart_source = 0;   /* 本次定时器已触发 */
 
     /* 每次重连重新读 config.ini: Web 后台可能已改 RTSP 地址,
      * 用启动时的快照会导致永远连旧地址 */
     config_parse(CONFIG_FILE, &g_cfg);
+    inject_creds(&g_cfg);   /* 重新注入凭据 (M-12) */
 
     LOGI("重连中 (等待 %ds)...", g_retry_delay);
+
+    /* 先移除旧 bus watch 再销毁管道: 旧 watch 持有旧 bus 引用,
+     * 不移除则每次重连泄漏一个 GSource (M-10); 移除后旧管道的
+     * ERROR/EOS 不再被分发, 消除双重启竞态 */
+    if (g_bus_watch) {
+        g_source_remove(g_bus_watch);
+        g_bus_watch = 0;
+    }
     gst_element_set_state(g_pipeline, GST_STATE_NULL);
     gst_object_unref(g_pipeline);
     g_pipeline = NULL;
@@ -53,20 +107,20 @@ static gboolean restart_pipeline_cb(gpointer data) {
     g_pipeline = build_pipeline(&g_cfg);
     if (!g_pipeline) {
         LOGE("管道重建失败, 再次重试");
-        g_timeout_add_seconds(g_retry_delay, restart_pipeline_cb, NULL);
+        schedule_restart();
         if (g_retry_delay < 30) g_retry_delay *= 2;
         return G_SOURCE_REMOVE;
     }
 
     GstBus *bus = gst_element_get_bus(g_pipeline);
-    gst_bus_add_watch(bus, on_bus_message, NULL);
+    g_bus_watch = gst_bus_add_watch(bus, on_bus_message, NULL);
     gst_object_unref(bus);
 
     GstStateChangeReturn ret =
         gst_element_set_state(g_pipeline, GST_STATE_PLAYING);
     if (ret == GST_STATE_CHANGE_FAILURE) {
         LOGE("管道重启失败, 再次重试");
-        g_timeout_add_seconds(g_retry_delay, restart_pipeline_cb, NULL);
+        schedule_restart();
         if (g_retry_delay < 30) g_retry_delay *= 2;
         return G_SOURCE_REMOVE;
     }
@@ -84,7 +138,7 @@ static gboolean on_bus_message(GstBus *bus, GstMessage *msg, gpointer data) {
     switch (GST_MESSAGE_TYPE(msg)) {
     case GST_MESSAGE_EOS:
         LOGW("GStreamer: 流结束 (EOS), 准备重连");
-        g_timeout_add_seconds(g_retry_delay, restart_pipeline_cb, NULL);
+        schedule_restart();
         break;
     case GST_MESSAGE_ERROR: {
         GError *err = NULL;
@@ -95,7 +149,7 @@ static gboolean on_bus_message(GstBus *bus, GstMessage *msg, gpointer data) {
             LOGD("调试: %s", dbg);
         g_error_free(err);
         g_free(dbg);
-        g_timeout_add_seconds(g_retry_delay, restart_pipeline_cb, NULL);
+        schedule_restart();
         break;
     }
     case GST_MESSAGE_WARNING: {
@@ -437,35 +491,7 @@ int main(int argc, char *argv[]) {
     }
 
     config_parse(cfg_path, &g_cfg);
-
-    /* 从凭据文件注入 user:pass@ 到 RTSP URL (不在 config.ini 暴露明文密码) */
-    if (!strstr(g_cfg.rtsp_url, "@")) {
-        FILE *cf = fopen("/root/camera-web/creds", "r");
-        if (cf) {
-            char line[128];
-            if (fgets(line, sizeof(line), cf)) {
-                size_t l = strlen(line);
-                while (l > 0 && (line[l-1] == '\n' || line[l-1] == '\r')) line[--l] = '\0';
-                char *colon = strchr(line, ':');
-                /* 密码为空不注入: 让 URL 自带的 ?username=&password= 认证生效
-                 * (海康 GetStreamUri 格式); 注入 admin:@ 空凭据反而 401 */
-                if (colon && colon[1] != '\0') {
-                    *colon = '\0';
-                    const char *proto = strstr(g_cfg.rtsp_url, "://");
-                    if (proto) {
-                        proto += 3;
-                        char tmp[MAX_PATH];
-                        snprintf(tmp, sizeof(tmp), "%.*s%s:%s@%s",
-                                 (int)(proto - g_cfg.rtsp_url), g_cfg.rtsp_url,
-                                 line, colon + 1, proto);
-                        strncpy(g_cfg.rtsp_url, tmp, MAX_PATH - 1);
-                        g_cfg.rtsp_url[MAX_PATH - 1] = '\0';
-                    }
-                }
-            }
-            fclose(cf);
-        }
-    }
+    inject_creds(&g_cfg);   /* 从凭据文件注入 user:pass@ (M-12 重连复用) */
     log_set_level(g_cfg.log_level);
 
     FILE *lf = fopen("/var/log/rv1126_gst.log", "a");
@@ -501,9 +527,9 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* 监听 bus 消息 */
+    /* 监听 bus 消息 (id 存入 g_bus_watch: 重连时先移除再销毁, 防泄漏) */
     GstBus *bus = gst_element_get_bus(g_pipeline);
-    guint watch_id = gst_bus_add_watch(bus, on_bus_message, NULL);
+    g_bus_watch = gst_bus_add_watch(bus, on_bus_message, NULL);
     gst_object_unref(bus);
 
     /* 启动管道 */
@@ -513,7 +539,8 @@ int main(int argc, char *argv[]) {
     if (ret == GST_STATE_CHANGE_FAILURE) {
         LOGE("管道启动失败");
         gst_object_unref(g_pipeline);
-        g_source_remove(watch_id);
+        g_source_remove(g_bus_watch);
+        g_bus_watch = 0;
         fb_deinit(&g_fb);
         if (lf) fclose(lf);
         return 1;
@@ -529,7 +556,8 @@ int main(int argc, char *argv[]) {
     /* 清理 */
     LOGI("停止管道...");
     gst_element_set_state(g_pipeline, GST_STATE_NULL);
-    g_source_remove(watch_id);
+    g_source_remove(g_bus_watch);
+    g_bus_watch = 0;
     g_main_loop_unref(g_loop);
     gst_object_unref(g_pipeline);
     fb_deinit(&g_fb);

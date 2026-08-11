@@ -612,6 +612,23 @@ fn inject_creds(url: &str) -> String {
     url.to_string()
 }
 
+/// HLS 转码子进程 pid (精确管理: 不用 killall 误杀预览转码, 修复互踩;
+/// spawn 不后台化, web 崩溃后不再留孤儿 gst-launch)
+static HLS_CHILD: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);
+
+/// 精确 kill HLS 转码进程 (只杀自己的, 不动预览)
+async fn kill_hls_child() {
+    /* 先 take 再 await: if-let 里的 MutexGuard 临时值存活到语句结束,
+     * 体内 await 会让 future 非 Send → axum Handler 不满足 (踩坑) */
+    let pid = HLS_CHILD.lock().unwrap().take();
+    if let Some(pid) = pid {
+        let _ = Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .output()
+            .await;
+    }
+}
+
 async fn hls_start(url: &str) -> (String, String) {
     let tok = gen_token();
     let _ = tokio::fs::write("/tmp/hls_token", &tok).await;
@@ -622,11 +639,8 @@ async fn hls_start(url: &str) -> (String, String) {
     // Shell-escape single quotes
     let safe_url = authed_url.replace('\'', "'\\''");
 
-    // Kill old transcoder
-    let _ = Command::new("killall")
-        .args(["-9", "gst-launch-1.0"])
-        .output()
-        .await;
+    // 只杀自己的旧转码进程, 不误杀预览转码 (L-07)
+    kill_hls_child().await;
 
     tokio::time::sleep(Duration::from_millis(300)).await;
     let _ = Command::new("sh")
@@ -635,16 +649,43 @@ async fn hls_start(url: &str) -> (String, String) {
         .output()
         .await;
 
+    // 直接 spawn 并保存 pid (不走 sh -c "cmd &" 后台化: 那会丢 pid,
+    // 退出后留孤儿进程; 重定向用 Stdio, 等价于 </dev/null >log 2>&1)
     let cmd = format!(
         "gst-launch-1.0 rtspsrc location='{}' latency=100 \
          ! rtph264depay ! h264parse \
          ! hlssink2 location='/root/hls/seg_%05d.ts' \
          playlist-location='/root/hls/stream.m3u8' \
-         target-duration=1 max-files=30 playlist-length=4 \
-         </dev/null >/tmp/hls.log 2>&1 &",
+         target-duration=1 max-files=30 playlist-length=4",
         safe_url
     );
-    let _ = Command::new("sh").arg("-c").arg(&cmd).output().await;
+    let logf = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/hls.log")
+        .ok();
+    let mut spawn = std::process::Command::new("sh");
+    spawn.arg("-c").arg(&cmd).stdin(std::process::Stdio::null());
+    if let Some(f) = logf {
+        match f.try_clone() {
+            Ok(clone) => {
+                spawn.stdout(std::process::Stdio::from(clone));
+                spawn.stderr(std::process::Stdio::from(f));
+            }
+            Err(_) => {
+                spawn.stdout(std::process::Stdio::from(f));
+            }
+        }
+    }
+    match spawn.spawn() {
+        Ok(c) => {
+            *HLS_CHILD.lock().unwrap() = Some(c.id());
+        }
+        Err(e) => {
+            eprintln!("hls_start spawn 失败: {e}");
+            return (String::new(), safe_url);   /* tok 为空 → 调用方回 500 */
+        }
+    }
 
     (tok, safe_url)
 }
@@ -817,7 +858,13 @@ async fn handle_login(
 
     state.login_fails.lock().await.clear();
     let token = gen_token();
-    state.sessions.lock().await.insert(token.clone(), now + 86400);
+    /* 惰性清理过期 session (L-02): 登录时扫一遍删除过期条目,
+     * 表大小有界, 不再只增不减 */
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.retain(|_, exp| now < *exp);
+        sessions.insert(token.clone(), now + 86400);
+    }
     /* 默认密码提醒: 前端收到 default_pw=true 强制引导改密 (扫1 #5) */
     let is_default = *state.pw_hash.lock().await == DEFAULT_HASH;
     (StatusCode::OK, Json(serde_json::json!({"status":"ok","token":token,"default_pw":is_default}))).into_response()
@@ -980,7 +1027,12 @@ async fn handle_logout(
         }
     }
     let _ = std::fs::remove_file("/tmp/hls_token");
-    let _ = Command::new("killall").args(["-9", "gst-launch-1.0"]).output().await;
+    // 精确杀 HLS + 预览转码, 不误伤 (L-07)
+    kill_hls_child().await;
+    if let Some(mut c) = PREVIEW_CHILD.lock().unwrap().take() {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
     Json(serde_json::json!({"status":"ok"})).into_response()
 }
 
@@ -1061,6 +1113,10 @@ async fn handle_hls_start(
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"missing url"}))).into_response();
     }
     let (tok, _) = hls_start(&url).await;
+    if tok.is_empty() {
+        return (StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error":"转码进程启动失败"}))).into_response();
+    }
     (StatusCode::OK, Json(serde_json::json!({"status":"ok","hls_token":tok}))).into_response()
 }
 
@@ -1069,7 +1125,8 @@ async fn handle_hls_stop(
     headers: axum::http::HeaderMap,
 ) -> Response {
     if !check_auth(&state, &headers).await { return unauthorized(); }
-    let _ = Command::new("killall").args(["-9", "gst-launch-1.0"]).output().await;
+    // 只杀自己的 HLS 转码, 不误杀预览 (L-07)
+    kill_hls_child().await;
     let _ = std::fs::remove_file("/tmp/hls_token");
     // 停止预览后清理分片缓存 (避免残留最多 30 个 ts 文件)
     let _ = Command::new("sh")
@@ -1846,6 +1903,13 @@ async fn main() {
         }
     };
     println!("rv1126_web (Rust) 已启动: http://0.0.0.0:8090");
+
+    // 清理上次崩溃遗留的孤儿转码进程 (启动瞬间没有自己 spawn 的进程,
+    // killall 安全; 运行期不再用 killall 防误杀预览)
+    let _ = Command::new("killall")
+        .args(["-9", "gst-launch-1.0"])
+        .output()
+        .await;
     if let Err(e) = axum::serve(listener, app).await {
         eprintln!("ERROR: 服务异常退出: {}", e);
         std::process::exit(1);

@@ -420,18 +420,27 @@ int main(int argc, char *argv[]) {
     g_st[ST_480].w = 1280; g_st[ST_480].h = 720;
     g_st[ST_480].bps = 1500000; g_st[ST_480].fps = 30;
 
+    /* 先构建 480p 分支 (appsrc 就位), 再构建 1080p — 1080p 进入
+     * PLAYING 时 push_src 已可用, 消除启动瞬间 rawsink 丢帧窗口
+     * (L-04: 原顺序 1080p 先 PLAYING, push_src 还是 NULL) */
+    g_st[ST_480].pipe = build_pipeline(&g_st[ST_480]);
+    if (!g_st[ST_480].pipe)
+        return 1;
+    rtsp_server_set_frame_step(g_st[ST_480].mount, 90000 / g_st[ST_480].fps);
+    g_st[ST_1080].push_src = g_st[ST_480].push_src;
+
     for (int i = 0; i < 3; i++) {
         if (i == ST_MAIN) {          /* 实验: 主线禁用, 预算全给子线 */
             printf("[producer] 主线禁用 (实验: 只跑子线)\n");
             continue;
         }
+        if (i == ST_480)             /* 已在上面构建 */
+            continue;
         g_st[i].pipe = build_pipeline(&g_st[i]);
         if (!g_st[i].pipe)
             return 1;
         rtsp_server_set_frame_step(g_st[i].mount, 90000 / g_st[i].fps);
     }
-    /* 480p 管线的 appsrc 接给 1080p 的原始帧出口 */
-    g_st[ST_1080].push_src = g_st[ST_480].push_src;
     printf("[producer] 480p 分支已接: 1080p 原始帧 → videoscale → 编码\n");
 
     /* ONVIF: 三个 profile + MJPEG 预览源 */
