@@ -53,9 +53,12 @@ typedef struct {
     GstElement *pipe;
     GstAppSink *sink;        /* 编码出口 (H.264 → feed 挂载点) */
     GstAppSink *raw_sink;    /* 原始帧出口 (NV12 → 推给 480p 管线) */
+    GstAppSink *draw_sink;   /* 画框源 (原始帧 → 画检测框 → JPEG 预览) */
     GstAppSink *jpeg_sink;   /* JPEG 预览出口 (最新帧 → /preview) */
-    GstElement *push_src;    /* 480p 管线的 appsrc (收到原始帧后推给它) */
-    int raw_caps_set;        /* appsrc 完整 caps 是否已设 (含分辨率) */
+    GstElement *push_src;      /* stream2 管线的 appsrc (画框帧) */
+    GstElement *main_push_src; /* stream1 管线的 appsrc (画框帧) */
+    GstElement *jpeg_push_src; /* JPEG 管线的 appsrc (画框帧) */
+    int raw_caps_set;
     unsigned long feed_count;
 } stream_ctx_t;
 
@@ -126,6 +129,36 @@ static const onvif_profile_t g_profiles[3] = {
     { "Sub720",     "子码流720",  1280, 720,  "/stream2" },
 };
 
+/* NV12 帧上画绿色矩形框 (4px 粗) — 检测可视化 (画在自有拷贝上) */
+static void draw_rect_nv12(uint8_t *y, uint8_t *uv, int w, int h, int hs,
+                           int x0, int y0, int x1, int y1) {
+    const uint8_t YV = 150, UV = 50, VV = 30;   /* 绿色 NV12 */
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 >= w) x1 = w - 1;
+    if (y1 >= h) y1 = h - 1;
+    if (x1 < x0 || y1 < y0) return;
+    for (int t = 0; t < 4; t++) {
+        for (int x = x0; x <= x1; x++) {
+            y[y0 * hs + x] = YV;
+            y[y1 * hs + x] = YV;
+            int up = (y0 / 2) * hs + (x / 2) * 2;
+            uv[up] = UV; uv[up + 1] = VV;
+            up = (y1 / 2) * hs + (x / 2) * 2;
+            uv[up] = UV; uv[up + 1] = VV;
+        }
+        for (int yy = y0; yy <= y1; yy++) {
+            y[yy * hs + x0] = YV;
+            y[yy * hs + x1] = YV;
+            int up = (yy / 2) * hs + (x0 / 2) * 2;
+            uv[up] = UV; uv[up + 1] = VV;
+            up = (yy / 2) * hs + (x1 / 2) * 2;
+            uv[up] = UV; uv[up + 1] = VV;
+        }
+        x0++; y0++; x1--; y1--;
+    }
+}
+
 /* ---------------- appsink 回调 ---------------- */
 
 static GstFlowReturn on_new_sample(GstAppSink *appsink, gpointer user_data) {
@@ -156,6 +189,76 @@ static GstFlowReturn on_new_sample(GstAppSink *appsink, gpointer user_data) {
             }
             gst_buffer_unmap(buf, &map);
         }
+    } else if (st->draw_sink && appsink == st->draw_sink) {
+        /* 画框源: 拷贝帧 → NPU 检测 + 绿框叠加 → 分发三条编码管线
+         * (stream1 主码流 / stream2 子码流 / JPEG 预览 — 全带框;
+         * 拷贝到自有缓冲再画, 不写 DMABUF) */
+        GstMapInfo dm;
+        if (buf && gst_buffer_map(buf, &dm, GST_MAP_READ)) {
+            size_t ysz = (size_t)st->w * st->h;
+            static uint8_t *cpy = NULL;
+            static size_t cpy_cap = 0;
+            if (cpy_cap < ysz * 3 / 2) {
+                free(cpy);
+                cpy = malloc(ysz * 3 / 2);
+                cpy_cap = ysz * 3 / 2;
+            }
+            if (cpy && ysz * 3 / 2 <= dm.size) {
+                memcpy(cpy, dm.data, ysz);
+                memcpy(cpy + ysz, dm.data + ysz, ysz / 2);
+
+                /* NPU 检测: 每 3 帧喂一次, 结果画绿框 */
+                if (++det_feed_cnt % 3 == 0)
+                    detect_feed(cpy, cpy + ysz, st->w, st->h, st->w);
+                det_box_t boxes[8];
+                int nb = detect_get(boxes, 8);
+                for (int i = 0; i < nb; i++)
+                    draw_rect_nv12(cpy, cpy + ysz, st->w, st->h,
+                                   st->w, boxes[i].left, boxes[i].top,
+                                   boxes[i].right, boxes[i].bottom);
+                if (nb > 0) {
+                    printf("[detect] %d 个目标 (帧 %lu): ",
+                           nb, st->feed_count);
+                    for (int i = 0; i < nb; i++)
+                        printf("c%d@%.2f ", boxes[i].cls, boxes[i].conf);
+                    printf("\n");
+                }
+
+                /* 三路分发 (共享 buffer, ref 计数) */
+                GstBuffer *dup = gst_buffer_new_allocate(
+                    NULL, ysz * 3 / 2, NULL);
+                GstMapInfo wm;
+                gst_buffer_map(dup, &wm, GST_MAP_WRITE);
+                memcpy(wm.data, cpy, ysz * 3 / 2);
+                gst_buffer_unmap(dup, &wm);
+
+                static guint64 mpts = 0, spts = 0, jpts = 0;
+                if (st->main_push_src) {
+                    GstBuffer *b = gst_buffer_ref(dup);
+                    GST_BUFFER_PTS(b) = mpts;
+                    mpts += GST_SECOND / st->fps;
+                    gst_app_src_push_buffer(GST_APP_SRC(st->main_push_src), b);
+                }
+                if (st->push_src) {
+                    GstBuffer *b = gst_buffer_ref(dup);
+                    GST_BUFFER_PTS(b) = spts;
+                    spts += GST_SECOND / 30;
+                    if (gst_app_src_get_current_level_bytes(
+                            GST_APP_SRC(st->push_src)) < 1024 * 1024)
+                        gst_app_src_push_buffer(GST_APP_SRC(st->push_src), b);
+                    else
+                        gst_buffer_unref(b);
+                }
+                if (st->jpeg_push_src) {
+                    GstBuffer *b = gst_buffer_ref(dup);
+                    GST_BUFFER_PTS(b) = jpts;
+                    jpts += GST_SECOND / 5;
+                    gst_app_src_push_buffer(GST_APP_SRC(st->jpeg_push_src), b);
+                }
+                gst_buffer_unref(dup);
+            }
+            gst_buffer_unmap(buf, &dm);
+        }
     } else if (st->jpeg_sink && appsink == st->jpeg_sink) {
         /* JPEG 预览出口: 保存最新帧, 供 HTTP /preview 推送 */
         GstMapInfo map;
@@ -172,59 +275,6 @@ static GstFlowReturn on_new_sample(GstAppSink *appsink, gpointer user_data) {
             }
             pthread_mutex_unlock(&g_jpeg_lock);
             gst_buffer_unmap(buf, &map);
-        }
-    } else if (st->raw_sink && appsink == st->raw_sink) {
-        /* 原始帧出口: NV12 → NPU 检测 (每 3 帧) + 推给 480p 管线 */
-        if (buf && ++det_feed_cnt % 3 == 0) {
-            GstMapInfo dm;
-            if (gst_buffer_map(buf, &dm, GST_MAP_READ)) {
-                int w = 1920, h = 1080, hs = 1920;   /* 1080p 采集 */
-                GstCaps *sc = gst_sample_get_caps(sample);
-                if (sc) {
-                    GstVideoInfo vi;
-                    gst_video_info_init(&vi);
-                    if (gst_video_info_from_caps(&vi, sc)) {
-                        w = vi.width;
-                        h = vi.height;
-                        hs = GST_VIDEO_INFO_PLANE_STRIDE(&vi, 0);
-                    }
-                }
-                detect_feed(dm.data, dm.data + (size_t)w * h, w, h, hs);
-                gst_buffer_unmap(buf, &dm);
-                det_box_t boxes[8];
-                int nb = detect_get(boxes, 8);
-                if (nb > 0) {
-                    printf("[detect] %d 个目标 (帧 %lu): ",
-                           nb, st->feed_count);
-                    for (int i = 0; i < nb; i++)
-                        printf("c%d@%.2f ", boxes[i].cls, boxes[i].conf);
-                    printf("\n");
-                }
-            }
-        }
-        if (st->push_src && buf) {
-            /* 第一帧: 用 sample 的完整 caps (含分辨率) 设置 appsrc —
-             * 只给 format 会让 videoscale 无法协商 (not-negotiated) */
-            if (!st->raw_caps_set) {
-                GstCaps *scaps = gst_sample_get_caps(sample);
-                if (scaps) {
-                    gst_app_src_set_caps(GST_APP_SRC(st->push_src), scaps);
-                    st->raw_caps_set = 1;
-                }
-            }
-            /* 下游满就丢帧, 绝不阻塞 1080p 主链路 */
-            if (gst_app_src_get_current_level_bytes(GST_APP_SRC(st->push_src))
-                    > 1024 * 1024) {
-                gst_sample_unref(sample);   /* 帧属于 sample, 直接丢弃 */
-                return GST_FLOW_OK;
-            }
-            GstBuffer *dup = gst_buffer_ref(buf);
-            GstFlowReturn fr = gst_app_src_push_buffer(GST_APP_SRC(st->push_src),
-                                                       dup);
-            if (fr != GST_FLOW_OK) {
-                printf("[producer] appsrc push 失败: %d\n", fr);
-                gst_buffer_unref(dup);
-            }
         }
     }
 
@@ -258,19 +308,13 @@ static gboolean on_bus_message(GstBus *bus, GstMessage *msg, gpointer user_data)
 static GstElement *build_pipeline(stream_ctx_t *st) {
     char launch[640];
     if (st->raw_sink) {
-        /* 1080p 管线: tee 三叉 — 编码出口 + 原始帧出口(480p) + JPEG 预览 */
+        /* 1080p 采集管线: 原始帧 → drawsink (拷贝画框后分发三条编码管线:
+         * stream1 主码流 + stream2 子码流 + JPEG 预览 — 全带检测框) */
         snprintf(launch, sizeof launch,
                  "v4l2src device=%s ! "
                  "video/x-raw,format=NV12,width=%d,height=%d,framerate=30/1 ! "
-                 "tee name=t ! queue ! videorate ! "
-                 "video/x-raw,format=NV12,framerate=%d/1 ! "
-                 "mpph264enc bps=%d ! appsink name=sink "
-                 "t. ! queue ! appsink name=rawsink "
-                 "t. ! queue ! videoscale ! videorate ! "
-                 "video/x-raw,format=NV12,width=720,height=480,"
-                 "framerate=5/1 ! "
-                 "mppjpegenc ! appsink name=jpegsink",
-                 st->device, st->w, st->h, st->fps, st->bps);
+                 "queue ! appsink name=drawsink",
+                 st->device, st->w, st->h);
     } else if (st->device) {
         snprintf(launch, sizeof launch,
                  "v4l2src device=%s ! "
@@ -311,26 +355,77 @@ static GstElement *build_pipeline(stream_ctx_t *st) {
     st->sink = sink;
 
     if (st->raw_sink) {
-        GstAppSink *raw = GST_APP_SINK(gst_bin_get_by_name(GST_BIN(pipe), "rawsink"));
-        if (!raw) {
-            fprintf(stderr, "[producer] %s 找不到 rawsink\n", st->path);
+        /* 画框源: 采集帧 → 拷贝画框 → 分发三条编码管线 */
+        GstAppSink *draw = GST_APP_SINK(
+            gst_bin_get_by_name(GST_BIN(pipe), "drawsink"));
+        if (!draw) {
+            fprintf(stderr, "[producer] %s 找不到 drawsink\n", st->path);
             return NULL;
         }
-        gst_app_sink_set_callbacks(raw, &callbacks, st, NULL);
-        gst_app_sink_set_max_buffers(raw, 1);
-        gst_app_sink_set_drop(raw, TRUE);
-        st->raw_sink = raw;
+        gst_app_sink_set_callbacks(draw, &callbacks, st, NULL);
+        gst_app_sink_set_max_buffers(draw, 1);
+        gst_app_sink_set_drop(draw, TRUE);
+        st->draw_sink = draw;
 
-        /* JPEG 预览出口 */
-        GstAppSink *jpeg = GST_APP_SINK(gst_bin_get_by_name(GST_BIN(pipe), "jpegsink"));
-        if (jpeg) {
-            gst_app_sink_set_callbacks(jpeg, &callbacks, st, NULL);
-            gst_app_sink_set_max_buffers(jpeg, 1);
-            gst_app_sink_set_drop(jpeg, TRUE);
-            st->jpeg_sink = jpeg;
+        /* stream1 编码管线: 画框帧 → videorate → mpph264enc (主码流带框) */
+        char mlaunch[640];
+        snprintf(mlaunch, sizeof mlaunch,
+                 "appsrc name=main_src is-live=true format=time "
+                 "caps=\"video/x-raw,format=NV12,width=%d,height=%d,"
+                 "framerate=%d/1\" ! queue ! videorate ! "
+                 "video/x-raw,format=NV12,framerate=%d/1 ! "
+                 "mpph264enc bps=%d ! appsink name=sink",
+                 st->w, st->h, st->fps, st->fps, st->bps);
+        GError *merr = NULL;
+        GstElement *mpipe = gst_parse_launch(mlaunch, &merr);
+        if (!mpipe) {
+            fprintf(stderr, "[producer] stream1 编码管线失败: %s\n",
+                    merr ? merr->message : "?");
+            return NULL;
+        }
+        GstElement *msrc = gst_bin_get_by_name(GST_BIN(mpipe), "main_src");
+        GstAppSink *msink = GST_APP_SINK(
+            gst_bin_get_by_name(GST_BIN(mpipe), "sink"));
+        if (!msrc || !msink) {
+            fprintf(stderr, "[producer] stream1 管线元素缺失\n");
+            return NULL;
+        }
+        gst_app_sink_set_callbacks(msink, &callbacks, st, NULL);
+        gst_app_sink_set_max_buffers(msink, 1);
+        gst_app_sink_set_drop(msink, TRUE);
+        st->sink = msink;                 /* NAL 出口 (feed /stream1) */
+        st->main_push_src = msrc;
+        gst_element_set_state(mpipe, GST_STATE_PLAYING);
+
+        /* JPEG 预览管线: 画框帧 → 缩放 720x480 → CPU jpegenc */
+        char jlaunch[640];
+        snprintf(jlaunch, sizeof jlaunch,
+                 "appsrc name=jpegsrc is-live=true format=time "
+                 "caps=\"video/x-raw,format=NV12,width=%d,height=%d,"
+                 "framerate=5/1\" ! queue ! videoscale ! "
+                 "video/x-raw,format=NV12,width=720,height=480 ! "
+                 "videoconvert ! video/x-raw,format=I420 ! "
+                 "jpegenc ! appsink name=jpegsink",
+                 st->w, st->h);
+        GError *jerr = NULL;
+        GstElement *jpipe = gst_parse_launch(jlaunch, &jerr);
+        if (!jpipe) {
+            fprintf(stderr, "[producer] JPEG 管线构建失败: %s\n",
+                    jerr ? jerr->message : "?");
         } else {
-            fprintf(stderr, "[producer] %s 找不到 jpegsink (JPEG 预览禁用)\n",
-                    st->path);
+            GstElement *jsrc = gst_bin_get_by_name(GST_BIN(jpipe), "jpegsrc");
+            GstAppSink *jpeg = GST_APP_SINK(gst_bin_get_by_name(
+                GST_BIN(jpipe), "jpegsink"));
+            if (jsrc && jpeg) {
+                gst_app_sink_set_callbacks(jpeg, &callbacks, st, NULL);
+                gst_app_sink_set_max_buffers(jpeg, 1);
+                gst_app_sink_set_drop(jpeg, TRUE);
+                st->jpeg_push_src = jsrc;
+                st->jpeg_sink = jpeg;
+                gst_element_set_state(jpipe, GST_STATE_PLAYING);
+            } else {
+                fprintf(stderr, "[producer] JPEG 管线元素缺失\n");
+            }
         }
     }
 
