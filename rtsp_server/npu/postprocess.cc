@@ -177,9 +177,11 @@ static int quick_sort_indice_inverse(std::vector<float> &input, int left, int ri
     return low;
 }
 
-static float sigmoid(float x) { return 1.0 / (1.0 + expf(-x)); }
+/* fp 模型走 process_fp32, 量化路径函数未使用 — 标注避免 -Wall 警告
+ * (Rockchip 官方参考代码, 保留以备 INT8 量化模型) */
+__attribute__((unused)) static float sigmoid(float x) { return 1.0 / (1.0 + expf(-x)); }
 
-static float unsigmoid(float y) { return -1.0 * logf((1.0 / y) - 1.0); }
+__attribute__((unused)) static float unsigmoid(float y) { return -1.0 * logf((1.0 / y) - 1.0); }
 
 inline static int32_t __clip(float val, float min, float max)
 {
@@ -222,7 +224,7 @@ static void compute_dfl(float* tensor, int dfl_len, float* box){
     }
 }
 
-static int process_u8(uint8_t *box_tensor, int32_t box_zp, float box_scale,
+__attribute__((unused)) static int process_u8(uint8_t *box_tensor, int32_t box_zp, float box_scale,
                       uint8_t *score_tensor, int32_t score_zp, float score_scale,
                       uint8_t *score_sum_tensor, int32_t score_sum_zp, float score_sum_scale,
                       int grid_h, int grid_w, int stride, int dfl_len,
@@ -667,7 +669,7 @@ int init_post_process()
     return 0;
 }
 
-char *coco_cls_to_name(int cls_id)
+const char *coco_cls_to_name(int cls_id)
 {
 
     if (cls_id >= OBJ_CLASS_NUM)

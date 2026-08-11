@@ -327,7 +327,9 @@ static GstElement *build_pipeline(stream_ctx_t *st) {
         fprintf(stderr, "[producer] %s 找不到 appsink\n", st->path);
         return NULL;
     }
-    static const GstAppSinkCallbacks callbacks = { .new_sample = on_new_sample };
+    /* 非 const: gst_app_sink_set_callbacks 签名是 GstAppSinkCallbacks*,
+     * const 会被 -Wdiscarded-qualifiers 警告 (GStreamer 历史 API) */
+    static GstAppSinkCallbacks callbacks = { .new_sample = on_new_sample };
     gst_app_sink_set_callbacks(sink, &callbacks, st, NULL);
     gst_app_sink_set_max_buffers(sink, 1);
     gst_app_sink_set_drop(sink, TRUE);

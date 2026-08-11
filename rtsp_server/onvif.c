@@ -342,7 +342,7 @@ static void hdr_system_date_time(onvif_server_t *o, char *out, size_t cap) {
     localtime_r(&now, &loc);
     /* 时区偏移 (秒) → +HH:MM */
     long off = loc.tm_gmtoff;
-    char tz[16];
+    char tz[32];   /* %+03ld 最多 17 字节 + 冒号分秒, 16 会截断 (Wformat-truncation) */
     snprintf(tz, sizeof tz, "%+03ld:%02ld", off / 3600, (off % 3600) / 60);
     snprintf(out, cap,
         "<tds:GetSystemDateAndTimeResponse>\n"
@@ -576,9 +576,9 @@ static void hdr_ptz_stop(onvif_server_t *o, char *out, size_t cap) {
 static void hdr_ptz_set_preset(onvif_server_t *o, const char *req,
                                char *out, size_t cap) {
     char token[32] = "", name[32] = "";
-    xml_extract(req, "tptz:PresetToken", token, sizeof token) != 0 &&
+    if (xml_extract(req, "tptz:PresetToken", token, sizeof token) != 0)
         xml_extract(req, "PresetToken", token, sizeof token);
-    xml_extract(req, "tptz:PresetName", name, sizeof name) != 0 &&
+    if (xml_extract(req, "tptz:PresetName", name, sizeof name) != 0)
         xml_extract(req, "PresetName", name, sizeof name);
     if (!token[0]) {
         snprintf(out, cap, "<tptz:SetPresetResponse/>\n");
@@ -604,7 +604,7 @@ static void hdr_ptz_set_preset(onvif_server_t *o, const char *req,
 static void hdr_ptz_goto_preset(onvif_server_t *o, const char *req,
                                 char *out, size_t cap) {
     char token[32] = "";
-    xml_extract(req, "tptz:PresetToken", token, sizeof token) != 0 &&
+    if (xml_extract(req, "tptz:PresetToken", token, sizeof token) != 0)
         xml_extract(req, "PresetToken", token, sizeof token);
     if (o->preset_cb)
         o->preset_cb(token[0] ? token : "?", 1, o->preset_ctx);
@@ -638,7 +638,7 @@ static void hdr_ptz_get_presets(onvif_server_t *o, char *out, size_t cap) {
 static void hdr_ptz_remove_preset(onvif_server_t *o, const char *req,
                                   char *out, size_t cap) {
     char token[32] = "";
-    xml_extract(req, "tptz:PresetToken", token, sizeof token) != 0 &&
+    if (xml_extract(req, "tptz:PresetToken", token, sizeof token) != 0)
         xml_extract(req, "PresetToken", token, sizeof token);
     for (int i = 0; i < o->preset_count; i++) {
         if (strncmp(o->presets[i], token, strlen(token)) == 0) {
