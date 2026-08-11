@@ -87,6 +87,16 @@ pre{background:#0a0e17;padding:10px;border-radius:8px;overflow-x:auto;font-size:
       <button class="btn btn-primary" onclick="togglePreviewMode()">&#9889; 低延迟预览</button>
       <button class="btn btn-danger" onclick="stopPreview()">&#9632; 停止预览</button>
     </div>
+    <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
+      <span style="font-size:13px;color:#666">&#x1F4F7; 云台:</span>
+      <button class="btn" style="background:#1d4ed8;color:#fff;border:none;border-radius:6px;cursor:pointer"
+              onmousedown="ptzMove('left')" onmouseup="ptzStop()" onmouseleave="ptzStop()"
+              ontouchstart="ptzMove('left')" ontouchend="ptzStop()">&#x25C0; 左转</button>
+      <button class="btn btn-danger" onclick="ptzStop()">&#9632; 停止</button>
+      <button class="btn" style="background:#1d4ed8;color:#fff;border:none;border-radius:6px;cursor:pointer"
+              onmousedown="ptzMove('right')" onmouseup="ptzStop()" onmouseleave="ptzStop()"
+              ontouchstart="ptzMove('right')" ontouchend="ptzStop()">右转 &#x25B6;</button>
+    </div>
   </div>
 </div>
 
@@ -738,6 +748,18 @@ function stopPreview() {
   previewMJPEG = false;
   apiFetch('/api/hls_stop', {method: 'POST'}).catch(()=>{});
   apiFetch('/api/preview_stop', {method: 'POST'}).catch(()=>{});
+}
+
+/* === 云台控制: 按住转, 松开停 (ContinuousMove → Stop) === */
+function ptzMove(dir) {
+  apiFetch('/api/ptz', {
+    method: 'POST', body: JSON.stringify({dir: dir})
+  }).catch(()=>{});
+}
+function ptzStop() {
+  apiFetch('/api/ptz', {
+    method: 'POST', body: JSON.stringify({dir: 'stop'})
+  }).catch(()=>{});
 }
 
 function checkStatus() {

@@ -81,6 +81,22 @@ static int jpeg_get_latest(void *ctx, jpeg_frame_t *out) {
     return -1;
 }
 
+/* ---- PTZ 指令回调: 摄像头接受指令 (onvif.c 解析成功) 后立即调用 ----
+ * 本机无云台 → 写 /tmp/ptz_dir, rtsp_display 在屏幕画箭头证明收到;
+ * 真实云台时代替为电机控制 (同一回调, 换实现不换接口) */
+static void on_ptz_command(ptz_dir_t dir, double speed, void *ctx) {
+    (void)ctx;
+    const char *s = dir == PTZ_LEFT ? "LEFT"
+                  : dir == PTZ_RIGHT ? "RIGHT"
+                  : "STOP";
+    FILE *f = fopen("/tmp/ptz_dir", "w");
+    if (f) {
+        fprintf(f, "%s %lld\n", s, (long long)g_get_monotonic_time());
+        fclose(f);
+    }
+    printf("[producer] PTZ 指令: %s (speed=%.2f) → 屏幕显示标识\n", s, speed);
+}
+
 #define ST_MAIN  0   /* /stream0  2688x1520 主码流 */
 #define ST_1080  1   /* /stream1  1920x1080 子码流 */
 #define ST_480   2   /* /stream2  720x480   显示用 (1080p 帧 CPU 缩放) */
@@ -353,6 +369,7 @@ int main(int argc, char *argv[]) {
     g_onvif = onvif_create(port);
     onvif_set_profiles(g_onvif, g_profiles, 3);
     onvif_set_jpeg_provider(g_onvif, jpeg_get_latest, NULL);
+    onvif_set_ptz_callback(g_onvif, on_ptz_command, NULL);
     if (onvif_start(g_onvif) != 0)
         fprintf(stderr, "[producer] ONVIF 启动失败 (摄像头管理将搜不到本机)\n");
     else

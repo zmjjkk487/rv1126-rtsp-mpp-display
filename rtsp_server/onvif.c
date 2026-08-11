@@ -45,6 +45,8 @@ struct onvif_server {
     char ircut[8];          /* 当前 IRCUT 模式 (仅状态, 未控硬件) */
     jpeg_provider_fn jpeg_fn;      /* MJPEG 预览帧提供者 */
     void *jpeg_ctx;
+    ptz_cb_fn ptz_cb;              /* PTZ 指令回调 (接受指令后调用) */
+    void *ptz_ctx;
     pthread_t ws_tid, http_tid;
 };
 
@@ -184,7 +186,8 @@ static void soap_response(const char *body_xml, char *out, size_t cap) {
         " xmlns:trt=\"http://www.onvif.org/ver10/media/wsdl\"\n"
         " xmlns:tds=\"http://www.onvif.org/ver10/device/wsdl\"\n"
         " xmlns:tt=\"http://www.onvif.org/ver10/schema\"\n"
-        " xmlns:t=\"http://www.onvif.org/ver10/schema\">\n"
+        " xmlns:t=\"http://www.onvif.org/ver10/schema\"\n"
+        " xmlns:tptz=\"http://www.onvif.org/ver20/ptz/wsdl\">\n"
         "<s:Body>\n%s\n</s:Body>\n</s:Envelope>\n",
         body_xml);
 }
@@ -540,6 +543,31 @@ static void hdr_set_network(onvif_server_t *o, const char *req, char *out, size_
     snprintf(out, cap, "<tds:SetNetworkInterfacesResponse/>\n");
 }
 
+/* ---------------- PTZ 云台控制 (ver20/ptz/wsdl) ----------------
+ * ContinuousMove: <tptz:Velocity><tt:PanTilt><tt:x>±1</tt:x></tt:PanTilt>
+ *   x>0 右转, x<0 左转 — 解析成功 (= 接受指令) 后立即回调,
+ *   由调用方决定动作 (本机无云台 → 屏幕标识验证; 真实云台 → 电机控制) */
+
+static void hdr_ptz_continuous(onvif_server_t *o, const char *req,
+                               char *out, size_t cap) {
+    char xs[16] = "0";
+    /* 前缀无关: 兼容 tt:x / t:x / 裸 x */
+    if (xml_extract(req, "tt:x", xs, sizeof xs) != 0 &&
+        xml_extract(req, "t:x", xs, sizeof xs) != 0)
+        xml_extract(req, "x", xs, sizeof xs);
+    double x = atof(xs);
+    ptz_dir_t dir = x > 0.01 ? PTZ_RIGHT : (x < -0.01 ? PTZ_LEFT : PTZ_STOP);
+    if (o->ptz_cb)
+        o->ptz_cb(dir, x < 0 ? -x : x, o->ptz_ctx);   /* 接受指令后的回调 */
+    snprintf(out, cap, "<tptz:ContinuousMoveResponse/>\n");
+}
+
+static void hdr_ptz_stop(onvif_server_t *o, char *out, size_t cap) {
+    if (o->ptz_cb)
+        o->ptz_cb(PTZ_STOP, 0, o->ptz_ctx);
+    snprintf(out, cap, "<tptz:StopResponse/>\n");
+}
+
 /* ---------------- MJPEG 低延迟预览 (GET /preview) ---------------- */
 
 /* 单调时钟微秒 (onvif.c 无 glib 依赖, 不能用 g_get_monotonic_time —
@@ -614,6 +642,8 @@ static void dispatch(onvif_server_t *o, const char *body, char *resp, size_t cap
     else if (strstr(body, "GetImagingSettings")) m = "GetImagingSettings";
     else if (strstr(body, "SetNetworkInterfaces")) m = "SetNetworkInterfaces";
     else if (strstr(body, "GetNetworkInterfaces")) m = "GetNetworkInterfaces";
+    else if (strstr(body, "ContinuousMove")) m = "ContinuousMove";
+    else if (strstr(body, "Stop>")) m = "PTZ Stop";
     else if (strstr(body, "GetSystemDateAndTime")) m = "GetSystemDateAndTime";
     else if (strstr(body, "GetCapabilities")) m = "GetCapabilities";
     else if (strstr(body, "GetServices")) m = "GetServices";
@@ -631,7 +661,11 @@ static void dispatch(onvif_server_t *o, const char *body, char *resp, size_t cap
     else if (strstr(body, "GetDeviceInformation")) m = "GetDeviceInformation";
     printf("[ONVIF] POST %s (%zu 字节)\n", m, strlen(body));
 
-    if (strstr(body, "SetImagingSettings")) {
+    if (strstr(body, "ContinuousMove")) {
+        hdr_ptz_continuous(o, body, body_xml, sizeof body_xml);
+    } else if (strstr(body, "Stop>")) {
+        hdr_ptz_stop(o, body_xml, sizeof body_xml);
+    } else if (strstr(body, "SetImagingSettings")) {
         /* 更新状态 (仅 UI 回显, 未控 IRCUT 硬件) */
         char mode[8] = "";
         if (xml_extract(body, "t:IrCutFilter", mode, sizeof mode) == 0 ||
@@ -1111,6 +1145,12 @@ void onvif_set_jpeg_provider(onvif_server_t *o, jpeg_provider_fn fn,
     if (!o) return;
     o->jpeg_fn = fn;
     o->jpeg_ctx = ctx;
+}
+
+void onvif_set_ptz_callback(onvif_server_t *o, ptz_cb_fn fn, void *ctx) {
+    if (!o) return;
+    o->ptz_cb = fn;
+    o->ptz_ctx = ctx;
 }
 
 int onvif_start(onvif_server_t *o) {

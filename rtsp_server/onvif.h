@@ -48,6 +48,12 @@ typedef int (*jpeg_provider_fn)(void *ctx, jpeg_frame_t *out);   /* 0=有帧 */
 void onvif_set_jpeg_provider(onvif_server_t *o, jpeg_provider_fn fn,
                              void *ctx);
 
+/* PTZ 云台控制: 摄像头接受指令 (解析成功) 后立即回调 —
+ * 本机无云台时用屏幕标识验证, 真实云台时代替为电机控制 */
+typedef enum { PTZ_NONE = 0, PTZ_LEFT, PTZ_RIGHT, PTZ_STOP } ptz_dir_t;
+typedef void (*ptz_cb_fn)(ptz_dir_t dir, double speed, void *ctx);
+void onvif_set_ptz_callback(onvif_server_t *o, ptz_cb_fn fn, void *ctx);
+
 /* 启动 UDP 3702 + HTTP :80 两个后台线程, 不阻塞 */
 int onvif_start(onvif_server_t *o);
 

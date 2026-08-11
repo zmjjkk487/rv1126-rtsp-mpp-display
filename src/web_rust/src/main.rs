@@ -290,7 +290,8 @@ fn make_soap_request(user: &str, pass: &str, body: &str) -> String {
             xmlns:trt="http://www.onvif.org/ver10/media/wsdl"
             xmlns:tds="http://www.onvif.org/ver10/device/wsdl"
             xmlns:t="http://www.onvif.org/ver10/schema"
-            xmlns:tt="http://www.onvif.org/ver10/schema">
+            xmlns:tt="http://www.onvif.org/ver10/schema"
+            xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl">
 <s:Header>
 <Security s:mustUnderstand="1" xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
 <UsernameToken>
@@ -318,7 +319,8 @@ fn make_plain_soap(body_xml: &str) -> String {
             xmlns:trt="http://www.onvif.org/ver10/media/wsdl"
             xmlns:tds="http://www.onvif.org/ver10/device/wsdl"
             xmlns:t="http://www.onvif.org/ver10/schema"
-            xmlns:tt="http://www.onvif.org/ver10/schema">
+            xmlns:tt="http://www.onvif.org/ver10/schema"
+            xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl">
 <s:Body>{}</s:Body>
 </s:Envelope>"#,
         body_xml
@@ -1269,6 +1271,50 @@ async fn handle_ircut(
     }
 }
 
+/// 发送 ONVIF PTZ 指令 (ContinuousMove 左/右转, Stop 停止)
+async fn onvif_ptz(ip: &str, user: &str, pass: &str, dir: &str) -> bool {
+    let body = match dir {
+        "left" => r#"<tptz:ContinuousMove><tptz:ProfileToken>MainStream</tptz:ProfileToken><tptz:Velocity><tt:PanTilt><tt:x>-1</tt:x><tt:y>0</tt:y></tt:PanTilt></tptz:Velocity></tptz:ContinuousMove>"#,
+        "right" => r#"<tptz:ContinuousMove><tptz:ProfileToken>MainStream</tptz:ProfileToken><tptz:Velocity><tt:PanTilt><tt:x>1</tt:x><tt:y>0</tt:y></tt:PanTilt></tptz:Velocity></tptz:ContinuousMove>"#,
+        _ => r#"<tptz:Stop><tptz:ProfileToken>MainStream</tptz:ProfileToken><tptz:PanTilt>true</tptz:PanTilt></tptz:Stop>"#,
+    };
+    let xml = match soap_post(&format!("http://{}/onvif/device_service", ip), body, user, pass).await {
+        Ok(x) => x,
+        Err(_) => return false,
+    };
+    !xml.contains("Fault")
+}
+
+/// POST /api/ptz — 云台控制 (body: {"dir":"left"|"right"|"stop"})
+/// 目标: 本机摄像头 (板子 producer 的 ONVIF :80) — 云台属于本机,
+/// 不是被显示的远端摄像头
+async fn handle_ptz(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if !check_auth(&state, &headers).await { return unauthorized(); }
+
+    let dir = body["dir"].as_str().unwrap_or("").to_string();
+    if dir != "left" && dir != "right" && dir != "stop" {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"dir must be left/right/stop"}))).into_response();
+    }
+
+    let ip = "127.0.0.1";   /* 本机摄像头: 板子自己 (producer ONVIF :80) */
+    let creds = std::fs::read_to_string(CREDS_FILE).unwrap_or_default();
+    let (user, pass) = match creds.trim().split_once(':') {
+        Some((u, p)) => (u.to_string(), p.to_string()),
+        None => ("admin".to_string(), "123456".to_string()),
+    };
+
+    let ok = onvif_ptz(&ip, &user, &pass, &dir).await;
+    if ok {
+        Json(serde_json::json!({"status":"ok","dir":dir})).into_response()
+    } else {
+        (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error":"ptz command failed"}))).into_response()
+    }
+}
+
 /// GET /api/system_info — 系统信息 (版本/内存/运行时长/网络)
 async fn handle_system_info(
     State(state): State<Arc<AppState>>,
@@ -1690,6 +1736,7 @@ async fn main() {
         .route("/api/preview_stop", post(handle_preview_stop))
         .route("/preview", get(handle_preview))
         .route("/api/ircut", post(handle_ircut))
+        .route("/api/ptz", post(handle_ptz))
         .route("/hls/stream.m3u8", get(handle_hls_m3u8))
         .route("/hls/:filename", get(handle_hls_ts))
         .route("/", get(handle_index))

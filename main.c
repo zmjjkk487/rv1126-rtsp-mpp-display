@@ -162,6 +162,64 @@ static void on_pad_added(GstElement *src, GstPad *pad, gpointer data) {
         gst_object_unref(sinkpad);
     }
 }
+/* ---------------- PTZ 指令屏幕标识 ----------------
+ * producer 接受 ONVIF 云台指令后写 /tmp/ptz_dir ("LEFT|RIGHT|STOP <us>"),
+ * 3 秒内有效 → 在视频帧上画大箭头 — 证明摄像头确实收到指令 (本机无云台) */
+static int64_t ptz_until = 0;
+static int ptz_left = 0;
+
+static void ptz_indicator_update(void) {
+    FILE *f = fopen("/tmp/ptz_dir", "r");
+    if (!f) { ptz_until = 0; return; }
+    char dir[16] = "";
+    long long ts = 0;
+    if (fscanf(f, "%15s %lld", dir, &ts) == 2) {
+        if (strcmp(dir, "STOP") == 0) {
+            ptz_until = 0;                       /* STOP: 立即清除 */
+        } else {
+            ptz_left = (strcmp(dir, "LEFT") == 0);
+            ptz_until = (int64_t)ts + 3000000;   /* 显示 3 秒 */
+        }
+    }
+    fclose(f);
+}
+
+/* 点是否在三角形内 (半平面测试, 整数运算, 无浮点) */
+static int pt_in_tri(int px, int py, int x0, int y0, int x1, int y1,
+                     int x2, int y2) {
+    int d1 = (px - x0) * (y1 - y0) - (py - y0) * (x1 - x0);
+    int d2 = (px - x1) * (y2 - y1) - (py - y1) * (x2 - x1);
+    int d3 = (px - x2) * (y0 - y2) - (py - y2) * (x0 - x2);
+    return !((d1 < 0) || (d2 < 0) || (d3 < 0)) ||
+           !((d1 > 0) || (d2 > 0) || (d3 > 0));
+}
+
+/* 在 NV12 帧顶部画一个大箭头 (亮红), left=1 指向左, 否则向右 */
+static void draw_ptz_arrow(uint8_t *y, uint8_t *uv, int w, int h, int hs,
+                           int left) {
+    const int B = 160;                     /* 箭头盒边长 */
+    int ax = (w - B) / 2, ay = 20;
+    const uint8_t YV = 150, UV = 90, VV = 240;   /* 亮红 (NV12 色度) */
+    for (int py = 0; py < B; py++) {
+        for (int px = 0; px < B; px++) {
+            /* 盒坐标 → 屏幕坐标 (left 时镜像 → 箭头反向) */
+            int xx = left ? (ax + B - 1 - px) : (ax + px);
+            int yy = ay + py;
+            if (xx < 0 || xx >= w || yy >= h) continue;
+            /* 右箭头: 三角 (指向右) + 尾杆 */
+            int inside = pt_in_tri(px, py, 12, 12, B - 12, B / 2, 12, B - 12) ||
+                         (px >= 12 && px <= B / 2 &&
+                          py >= B / 2 - 15 && py <= B / 2 + 15);
+            if (!inside) continue;
+            y[yy * hs + xx] = YV;
+            /* NV12 色度: 每 2x2 像素共享一对 U/V, 行距 = hs 字节 */
+            size_t up = (size_t)(yy / 2) * hs + (size_t)(xx / 2) * 2;
+            uv[up] = UV;
+            uv[up + 1] = VV;
+        }
+    }
+}
+
 /* appsink 回调: 收到 NV12 帧 → RGA 硬转 + fbdev 直写 */
 static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer data) {
     (void)data;
@@ -249,6 +307,12 @@ static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer data) {
         par_n = 12;
         par_d = 11;
     }
+
+    /* PTZ 屏幕标识: producer 收到云台指令后 3 秒内画箭头 (证明收到指令) */
+    if (frame_count % 5 == 0)
+        ptz_indicator_update();
+    if (ptz_until > 0 && g_get_monotonic_time() < ptz_until)
+        draw_ptz_arrow((uint8_t *)y, (uint8_t *)uv, w, h, hs, ptz_left);
 
     fb_show_nv12(&g_fb, y, uv, w, h, hs, vs, par_n, par_d);
 
