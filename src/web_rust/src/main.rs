@@ -1286,8 +1286,9 @@ async fn onvif_ptz(ip: &str, user: &str, pass: &str, dir: &str) -> bool {
 }
 
 /// POST /api/ptz — 云台控制 (body: {"dir":"left"|"right"|"stop"})
-/// 目标: 本机摄像头 (板子 producer 的 ONVIF :80) — 云台属于本机,
-/// 不是被显示的远端摄像头
+/// 目标 = 当前连接的码流所属摄像头 (camera_ip, 标准 ONVIF 语义:
+/// 连接哪个码流就控制那个摄像头的云台; 连本机码流 → 板子收到指令
+/// 屏幕画箭头验证, 连海康 → 指令发给海康)
 async fn handle_ptz(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -1300,7 +1301,11 @@ async fn handle_ptz(
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"dir must be left/right/stop"}))).into_response();
     }
 
-    let ip = "127.0.0.1";   /* 本机摄像头: 板子自己 (producer ONVIF :80) */
+    /* 控制目标: 前端传当前预览码流的 IP (连接谁控制谁);
+     * 未传时回退 config.ini 的摄像头 */
+    let ip = body["ip"].as_str().map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && !sanitize_ntp_server(s).is_empty())
+        .unwrap_or_else(camera_ip);
     let creds = std::fs::read_to_string(CREDS_FILE).unwrap_or_default();
     let (user, pass) = match creds.trim().split_once(':') {
         Some((u, p)) => (u.to_string(), p.to_string()),

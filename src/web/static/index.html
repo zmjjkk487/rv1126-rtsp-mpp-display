@@ -751,14 +751,23 @@ function stopPreview() {
 }
 
 /* === 云台控制: 按住转, 松开停 (ContinuousMove → Stop) === */
+/* 控制目标 = 当前预览的码流所属摄像头 (连接谁控制谁) */
+function ptzTargetIp() {
+  try {
+    let u = new URL(lastPreviewUrl);
+    return u.hostname || '';
+  } catch(e) { return ''; }
+}
 function ptzMove(dir) {
   apiFetch('/api/ptz', {
-    method: 'POST', body: JSON.stringify({dir: dir})
+    method: 'POST',
+    body: JSON.stringify({dir: dir, ip: ptzTargetIp()})
   }).catch(()=>{});
 }
 function ptzStop() {
   apiFetch('/api/ptz', {
-    method: 'POST', body: JSON.stringify({dir: 'stop'})
+    method: 'POST',
+    body: JSON.stringify({dir: 'stop', ip: ptzTargetIp()})
   }).catch(()=>{});
 }
 
